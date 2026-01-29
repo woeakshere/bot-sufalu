@@ -7,6 +7,8 @@ ENV PYTHONUNBUFFERED=1
 ENV PORT=8000
 
 # Install system dependencies
+# 1. Core tools (ffmpeg, aria2, etc.)
+# 2. Chromium dependencies (replacing broken 'playwright install-deps')
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     aria2 \
@@ -14,6 +16,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     unzip \
     gcc \
     python3-dev \
+    libnss3 \
+    libnspr4 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libcups2 \
+    libdrm2 \
+    libxkbcommon0 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxrandr2 \
+    libgbm1 \
+    libasound2 \
+    libpango-1.0-0 \
+    libpangocairo-1.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
@@ -23,11 +39,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Playwright and its dependencies
-# We install them in one layer and clean up to keep the image small
-RUN playwright install chromium && \
-    playwright install-deps chromium && \
-    rm -rf /var/lib/apt/lists/*
+# Install Chromium Browser only (We already installed deps above)
+RUN playwright install chromium
 
 # Copy application code
 COPY . .
@@ -35,12 +48,10 @@ COPY . .
 # Create downloads directory
 RUN mkdir -p /app/downloads
 
-# Expose the port (Koyeb uses the PORT env var, but EXPOSE is good practice)
+# Expose the port
 EXPOSE 8000
 
-# Start command
-# 1. Starts Aria2 daemon
-# 2. Starts Main Python Bot
+# Start command with Speed Optimizations & Trackers
 CMD aria2c \
     --enable-rpc \
     --rpc-listen-all=true \
