@@ -1,52 +1,60 @@
-# Use an official Python runtime
-FROM python:3.11-slim
+# Use a stable Debian Bookworm base (Fixes the "ttf-unifont" error)
+FROM python:3.11-slim-bookworm
 
-# Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV PORT=8000
-# Essential for automatic dependency installation
 ENV DEBIAN_FRONTEND=noninteractive
 
-# 1. Install Core System Tools & Downloader
-# We only install the basics here. Playwright will handle the browser libs later.
+# 1. Install System Tools & Chromium Dependencies Manually
+# We skip 'playwright install-deps' because it is buggy on Debian.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     aria2 \
     curl \
     git \
     procps \
+    # --- Browser Dependencies for Debian Bookworm ---
+    libnss3 \
+    libnspr4 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libcups2 \
+    libdrm2 \
+    libxkbcommon0 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxrandr2 \
+    libgbm1 \
+    libasound2 \
+    libpango-1.0-0 \
+    libpangocairo-1.0-0 \
+    libasound2 \
+    fonts-liberation \
+    fonts-unifont \
+    xdg-utils \
     && rm -rf /var/lib/apt/lists/*
 
-# Set working directory
 WORKDIR /app
 
-# 2. Install Python Dependencies
+# 2. Install Python Deps
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 3. Install Chromium & System Dependencies
-# 'install-deps' checks the exact browser version and installs 
-# the correct missing libraries (libnss, libatk, etc.) automatically.
+# 3. Install Chromium Browser Only
+# (Dependencies are already installed above)
 RUN playwright install chromium
-RUN playwright install-deps chromium
 
-# 4. Copy application code
+# 4. Copy Code
 COPY . .
 
 # --- CLEANUP ---
-# Keeps the image small
 RUN rm -rf /app/downloads /app/__pycache__ /app/.git /app/.github /app/bot/__pycache__ /app/utils/__pycache__ && \
     mkdir -p /app/downloads
 
-# Expose the port
 EXPOSE 8000
 
-# --- STARTUP COMMAND ---
-# 1. Kill old Aria2 zombies
-# 2. Clean download folder
-# 3. Start Aria2 Daemon (Fixed tracker string format)
-# 4. Start Python Bot
+# --- STARTUP ---
 CMD pkill -f aria2c || true && \
     rm -rf /app/downloads/* && \
     aria2c \
