@@ -1,65 +1,77 @@
+# intelligent_scraper.py
 import asyncio
-import random
-# Import the new safe browser utility
+import logging
 from utils.safe_browser import get_safe_browser
 
-class AnimeBot:
-    def __init__(self):
-        self.sites = [
+logger = logging.getLogger(__name__)
+
+TRUSTED_HOSTS = [
+    "mega.nz", "mediafire.com", "gofile.io", "pixeldrain.com",
+    "send.cm", "1fichier.com", "streamtape.com", "dood.to",
+    "filemoon.com", "mp4upload.com"
+]
+
+class IntelligentScraper:
+    def __init__(self, sites=None):
+        # List of anime search sites
+        self.sites = sites or [
             {"name": "AllAnime", "search_url": "https://allanime.to/search?q="},
+            {"name": "GogoAnime", "search_url": "https://www3.gogoanime.pe//search.html?keyword="},
         ]
 
-    async def get_search_results(self, page, site, query):
-        """Standardizes search result extraction across different sites."""
-        url = f"{site['search_url']}{query.replace(' ', '+')}"
-        
-        # SafeBrowser handles ad-blocking, so domcontentloaded is usually safe and faster
-        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        
-        results = []
-        try:
-            # Wait for either class commonly used in these site templates
-            await page.wait_for_selector(".anime-list, .item", timeout=10000)
-            elements = await page.query_selector_all(".anime-list .item, .item")
-            
-            for el in elements:
-                title_el = await el.query_selector(".name, .title")
-                link_el = await el.query_selector("a")
-                
-                if title_el and link_el:
-                    title = await title_el.inner_text()
-                    link = await link_el.get_attribute("href")
-                    
-                    if link.startswith("/"):
-                        base = "https://allanime.to" # Hardcoded base for reliability
-                        link = f"{base}{link}"
-                    
-                    # --- PRESET CONFIGURATION ---
-                    # AllAnime is typically a 'Direct Link' type source
-                    # handlers.py uses this 'type' to send the link directly to channel
-                    results.append({
-                        "title": title.strip(), 
-                        "url": link,
-                        "type": "link" # Triggers the 'lnk_' preset in handlers.py
-                    })
-        except Exception as e:
-            print(f"Error scraping {site['name']}: {e}")
-            
-        return results
-
-    async def run(self, query):
-        """
-        Executes search using the centralized SafeBrowser.
-        """
-        # Replaces manual Playwright setup with the intelligent context manager
+    async def search(self, query, top_n=5):
+        """Return top search results for the query."""
         async with get_safe_browser() as page:
-            all_results = []
+            results = []
             for site in self.sites:
                 try:
-                    results = await self.get_search_results(page, site, query)
-                    all_results.extend(results)
+                    search_url = f"{site['search_url']}{query.replace(' ', '+')}"
+                    await page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+                    await asyncio.sleep(1)
+
+                    # Find clickable items for anime results
+                    candidates = await page.query_selector_all("a, .item, .film-name, .name")
+                    for el in candidates[:top_n]:
+                        title = await el.inner_text()
+                        link = await el.get_attribute("href")
+                        if link.startswith("/"):
+                            base = site['search_url'].split("/search")[0]
+                            link = f"{base}{link}"
+                        results.append({"title": f"[{site['name']}] {title.strip()}", "url": link})
                 except Exception as e:
-                    print(f"Error on {site['name']}: {e}")
-                    continue
-            
-            return all_results
+                    logger.warning(f"Search failed on {site['name']}: {e}")
+            return results
+
+    async def resolve_download(self, anime_page_url, max_clicks=10):
+        """
+        Opens the anime page and intelligently clicks buttons
+        until a trusted download link is found.
+        """
+        async with get_safe_browser() as page:
+            try:
+                await page.goto(anime_page_url, wait_until="domcontentloaded", timeout=30000)
+                await asyncio.sleep(1)
+
+                candidates = await page.query_selector_all("a, button")
+                for idx, el in enumerate(candidates[:max_clicks]):
+                    try:
+                        await el.scroll_into_view_if_needed()
+                        await el.click()
+                        await asyncio.sleep(2)
+
+                        # Check main page URL
+                        url = page.url.lower()
+                        if any(host in url for host in TRUSTED_HOSTS):
+                            return url
+
+                        # Check all open pages (popups)
+                        for p in page.context.pages:
+                            p_url = p.url.lower()
+                            if any(host in p_url for host in TRUSTED_HOSTS):
+                                return p_url
+                    except:
+                        continue
+                return None
+            except Exception as e:
+                logger.error(f"Download resolution failed: {e}")
+                return None
