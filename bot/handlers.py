@@ -3,6 +3,7 @@ import shutil
 import logging
 import time
 import traceback
+import signal
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
@@ -67,7 +68,14 @@ async def send_error_log(update, context, error_msg):
 
 # --- COMMANDS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🚀 **Leech Bot Active**\n/search, /torrent, /stats", parse_mode="Markdown")
+    await update.message.reply_text(
+        "🚀 **Leech Bot Active**\n\n"
+        "/search <name> - Find anime\n"
+        "/torrent <link> - Direct download\n"
+        "/setthumb - Reply to photo to set custom thumbnail\n"
+        "/stats - Bot health", 
+        parse_mode="Markdown"
+    )
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("🔄 Checking...")
@@ -87,6 +95,21 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"**Traffic**: ⬇️ `{human_readable_size(down)}` | ⬆️ `{human_readable_size(up)}`"
     )
     await msg.edit_text(text, parse_mode="Markdown")
+
+async def set_thumb_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sets a custom thumbnail for the user."""
+    if not update.message.reply_to_message or not update.message.reply_to_message.photo:
+        return await update.message.reply_text("❌ Reply to a photo to set it as thumbnail.")
+    
+    msg = await update.message.reply_text("⬇️ Downloading photo...")
+    
+    # Download photo to memory (not disk)
+    photo = await update.message.reply_to_message.photo[-1].get_file()
+    photo_bytes = await photo.download_as_bytearray()
+    
+    # Save to DB
+    await db.set_thumbnail(update.effective_user.id, photo_bytes)
+    await msg.edit_text("✅ **Thumbnail Saved!**\nIt will appear on your next upload.", parse_mode="Markdown")
 
 # --- CORE LOGIC ---
 async def monitor_and_process_download(gid, update, context, status_msg):
@@ -127,6 +150,9 @@ async def monitor_and_process_download(gid, update, context, status_msg):
                 last_anime = None
                 last_ep = None
                 
+                # Pre-fetch thumbnail once to save DB calls in loop
+                thumb_data = await db.get_thumbnail(user_id)
+
                 for idx, v_path in enumerate(files):
                     fname = os.path.basename(v_path)
                     final_path = v_path
@@ -154,8 +180,16 @@ async def monitor_and_process_download(gid, update, context, status_msg):
                     # Upload
                     try:
                         await status_msg.edit_text(f"⬆️ **Uploading ({idx+1}/{len(files)})**")
+                        
                         with open(final_path, 'rb') as doc:
-                            await context.bot.send_document(Config.CHANNEL_ID, document=doc, caption=f"📂 `{fname}`", parse_mode="Markdown")
+                            # ATTACH THUMBNAIL HERE
+                            await context.bot.send_document(
+                                Config.CHANNEL_ID, 
+                                document=doc, 
+                                caption=f"📂 `{fname}`", 
+                                thumbnail=thumb_data, # <--- Used here
+                                parse_mode="Markdown"
+                            )
                         
                         anime, ep = await db.add_history(user_id, fname)
                         if anime: last_anime, last_ep = anime, ep
