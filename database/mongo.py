@@ -32,10 +32,12 @@ class MongoDB:
             logger.info("✅ MongoDB client initialized.")
         except Exception as e:
             logger.error(f"Failed to connect MongoDB: {e}")
+            self.db = None # Ensure it stays None on failure
 
     async def init_indexes(self):
         """Async-safe index creation with TTL cleanup"""
-        if not self.db:
+        # FIXED: Explicit check for None
+        if self.db is None:
             return
         try:
             # Unique per user + anime
@@ -53,7 +55,7 @@ class MongoDB:
 
     # --- Connection Health ---
     async def ping(self):
-        if not self.client:
+        if self.client is None:
             return False
         try:
             await self.client.admin.command("ping")
@@ -63,11 +65,11 @@ class MongoDB:
 
     # --- Stats & Traffic ---
     async def get_total_users(self):
-        if not self.db: return 0
+        if self.db is None: return 0
         return await self.users.count_documents({})
 
     async def get_total_traffic(self):
-        if not self.db: return 0, 0
+        if self.db is None: return 0, 0
         pipeline = [
             {"$group": {
                 "_id": None,
@@ -84,7 +86,7 @@ class MongoDB:
         return 0, 0
 
     async def update_stats(self, user_id, bytes_downloaded=0, bytes_uploaded=0):
-        if not self.db: return
+        if self.db is None: return
         await self.users.update_one(
             {"user_id": user_id},
             {
@@ -96,7 +98,7 @@ class MongoDB:
 
     # --- History & Episodes ---
     async def add_history(self, user_id, file_name):
-        if not self.db:
+        if self.db is None:
             return None, None
 
         # Supports "Anime - 12", "Anime.S01E12", "[Group] Anime - 12v2"
@@ -116,7 +118,7 @@ class MongoDB:
         return None, None
 
     async def delete_history(self, user_id, anime_name):
-        if not self.db: return False
+        if self.db is None: return False
         try:
             await self.history.delete_one({"user_id": user_id, "anime": anime_name})
             return True
@@ -125,7 +127,7 @@ class MongoDB:
             return False
 
     async def increment_episode(self, user_id, anime_name):
-        if not self.db: return
+        if self.db is None: return
         await self.history.update_one(
             {"user_id": user_id, "anime": anime_name},
             {"$inc": {"last_ep": 1}, "$set": {"last_updated": datetime.utcnow()}},
@@ -135,12 +137,12 @@ class MongoDB:
     # --- Thumbnails with LRU Cache ---
     @lru_cache(maxsize=128)
     async def get_thumbnail(self, user_id):
-        if not self.db: return None
+        if self.db is None: return None
         user = await self.users.find_one({"user_id": user_id})
         return user.get("thumbnail") if user else None
 
     async def set_thumbnail(self, user_id, photo_binary):
-        if not self.db: return
+        if self.db is None: return
         await self.users.update_one(
             {"user_id": user_id},
             {"$set": {"thumbnail": photo_binary}},
@@ -149,4 +151,3 @@ class MongoDB:
 
 # --- CREATE SINGLETON INSTANCE ---
 db = MongoDB()
-# ERROR WAS HERE: Removed global asyncio.create_task call
