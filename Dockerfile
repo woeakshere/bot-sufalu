@@ -5,60 +5,48 @@ FROM python:3.11-slim
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV PORT=8000
+# Essential for automatic dependency installation
+ENV DEBIAN_FRONTEND=noninteractive
 
-# Install system dependencies
-# 1. Core tools: ffmpeg, aria2, procps (for pkill)
-# 2. Chromium dependencies: Manually installed to avoid 'playwright install-deps' issues
+# 1. Install Core System Tools & Downloader
+# We only install the basics here. Playwright will handle the browser libs later.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     aria2 \
     curl \
-    unzip \
-    gcc \
-    python3-dev \
+    git \
     procps \
-    libnss3 \
-    libnspr4 \
-    libatk1.0-0 \
-    libatk-bridge2.0-0 \
-    libcups2 \
-    libdrm2 \
-    libxkbcommon0 \
-    libxcomposite1 \
-    libxdamage1 \
-    libxrandr2 \
-    libgbm1 \
-    libasound2 \
-    libpango-1.0-0 \
-    libpangocairo-1.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
 WORKDIR /app
 
-# Install Python dependencies
+# 2. Install Python Dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Chromium Browser only
+# 3. Install Chromium & System Dependencies
+# 'install-deps' checks the exact browser version and installs 
+# the correct missing libraries (libnss, libatk, etc.) automatically.
 RUN playwright install chromium
+RUN playwright install-deps chromium
 
-# Copy application code
+# 4. Copy application code
 COPY . .
 
-# --- CLEANUP STEP 1: BUILD TIME ---
-# Removes any junk (downloads, cache, git history) accidentally copied from your PC.
-# This ensures the Docker image is as small and clean as possible.
+# --- CLEANUP ---
+# Keeps the image small
 RUN rm -rf /app/downloads /app/__pycache__ /app/.git /app/.github /app/bot/__pycache__ /app/utils/__pycache__ && \
     mkdir -p /app/downloads
 
-# Expose the port for the Health Check Server
+# Expose the port
 EXPOSE 8000
 
-# --- CLEANUP STEP 2: STARTUP TIME ---
-# 1. 'pkill': Kills any "Zombie" Aria2 processes if the container restarted.
-# 2. 'rm -rf': Clears old downloads to free up disk space.
-# 3. 'exec': Critical! Replaces shell with Python so signals (SIGTERM) reach the bot.
+# --- STARTUP COMMAND ---
+# 1. Kill old Aria2 zombies
+# 2. Clean download folder
+# 3. Start Aria2 Daemon (Fixed tracker string format)
+# 4. Start Python Bot
 CMD pkill -f aria2c || true && \
     rm -rf /app/downloads/* && \
     aria2c \
