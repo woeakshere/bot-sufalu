@@ -1,240 +1,229 @@
 import asyncio
+import time
+import random
+import logging
+from contextlib import asynccontextmanager
 from playwright.async_api import async_playwright, Page, BrowserContext
 
-# --- CONFIGURATION ---
+logger = logging.getLogger(__name__)
 
-# Resources to block for faster loading and bandwidth saving
-BLOCKED_RESOURCES = [
-    "image", "font", "media", "websocket", "other", "manifest", "texttrack"
-]
+# =========================
+# AUTOPILOT CONFIG (HIDDEN)
+# =========================
 
-# Keywords in URL/Title that indicate an Ad, Tracker, or Spam tab
-AD_KEYWORDS = [
-    "betting", "casino", "poker", "dating", "adult", "click", 
-    "tracker", "analytics", "pixel", "adsystem", "syndication",
-    "doubleclick", "pop", "cash", "crypto", "forex", "profit", 
-    "revenue", "offer", "bonus", "game"
-]
+BLOCKED_RESOURCES = {
+    "image", "font", "media", "websocket", "manifest", "texttrack"
+}
 
-# Trusted File Hosts (Allow redirects to these domains for downloading)
-# Add any new hosts your scrapers use here.
-TRUSTED_FILE_HOSTS = [
-    "gofile", "krakenfiles", "mega.nz", "pixeldrain", "sendcm", 
-    "1fichier", "mediafire", "streamtape", "mp4upload", "dood", 
-    "filemoon", "vidstream", "allanime", "gogoanime", "animixplay"
-]
+AD_KEYWORDS = (
+    "ads", "doubleclick", "tracking", "analytics", "pixel",
+    "bet", "casino", "promo", "offer", "bonus", "profit",
+    "dating", "adult", "click", "pop", "redirect"
+)
+
+TRUSTED_HOSTS = (
+    "gofile", "pixeldrain", "krakenfiles", "mega",
+    "filemoon", "dood", "streamtape", "sendcm",
+    "mp4upload", "vidstream", "gogoanime", "allanime"
+)
+
+MAX_BROWSER_LIFETIME = 10 * 60   # recycle every 10 min
+MAX_PAGES_PER_CONTEXT = 5
+
+# =========================
+# AUTOPILOT SAFE BROWSER
+# =========================
 
 class SafeBrowser:
     """
-    A robust browser context manager that handles:
-    1. Stealth Mode (Bypasses bot detection)
-    2. Ad & Resource Blocking (Speed & Safety)
-    3. Smart Popup Killing (Closes ads, allows file hosts)
-    4. Auto-Cookie Consent (Clicks 'Accept' automatically)
-    5. Aggressive Cleanup (Wipes cache/workers on exit)
+    Fully automated, admin-proof, self-healing browser.
+    Usage stays IDENTICAL.
     """
+
     def __init__(self, headless=True):
         self.headless = headless
+        self._started_at = time.time()
+        self._page_count = 0
+
         self.playwright = None
         self.browser = None
         self.context = None
 
+    # -------------------------
+    # Context Manager
+    # -------------------------
+
     async def __aenter__(self) -> Page:
+        await self._boot()
+        page = await self._new_page()
+        return page
+
+    async def __aexit__(self, exc_type, exc, tb):
+        await self._cleanup()
+
+    # -------------------------
+    # Boot Sequence
+    # -------------------------
+
+    async def _boot(self):
         self.playwright = await async_playwright().start()
-        
-        # Launch Chromium with anti-detection arguments
+
         self.browser = await self.playwright.chromium.launch(
             headless=self.headless,
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
-                "--disable-infobars",
-                "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
-                "--disable-accelerated-2d-canvas",
                 "--disable-gpu",
-                "--window-size=1920,1080",
-                "--mute-audio" # Mute any auto-playing video ads
+                "--mute-audio",
+                "--disable-infobars"
             ]
         )
-        
-        # Create a persistent context structure (isolated session)
+
         self.context = await self.browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            viewport={'width': 1920, 'height': 1080},
-            locale='en-US',
-            timezone_id='America/New_York',
-            device_scale_factor=1,
-            has_touch=False,
+            user_agent=self._random_ua(),
+            viewport={"width": 1920, "height": 1080},
+            locale="en-US",
+            timezone_id="America/New_York",
             java_script_enabled=True,
         )
 
-        # 1. Activate Ad & Resource Blocker
-        await self._activate_ad_blocker(self.context)
-        
-        # 2. Activate Smart Popup Killer
-        await self._activate_smart_popup_killer(self.context)
-        
-        # 3. Apply Advanced Stealth Scripts
-        await self._apply_advanced_stealth(self.context)
-        
-        # 4. Activate Auto-Cookie Accepter
-        await self._inject_auto_consent(self.context)
+        await self._stealth(self.context)
+        await self._blockers(self.context)
+        await self._popup_guard(self.context)
+        await self._auto_consent(self.context)
 
-        # Return the main page
-        return await self.context.new_page()
+    # -------------------------
+    # Page Handling
+    # -------------------------
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        # 5. Perform Aggressive Cleanup before closing
-        if self.context:
-            await self._clean_unnecessary_data(self.context)
-            await self.context.close()
-            
-        if self.browser: await self.browser.close()
-        if self.playwright: await self.playwright.stop()
+    async def _new_page(self) -> Page:
+        self._page_count += 1
 
-    # --- INTERNAL UTILITIES ---
+        if self._should_recycle():
+            await self._recycle()
 
-    async def _activate_ad_blocker(self, context: BrowserContext):
-        """Blocks network requests for ads, trackers, and heavy resources."""
-        async def route_handler(route):
+        page = await self.context.new_page()
+        page.set_default_timeout(25_000)
+
+        await self._humanize(page)
+        return page
+
+    def _should_recycle(self):
+        return (
+            self._page_count >= MAX_PAGES_PER_CONTEXT or
+            time.time() - self._started_at > MAX_BROWSER_LIFETIME
+        )
+
+    async def _recycle(self):
+        logger.warning("♻️ Recycling browser context (RAM safety)")
+        await self._cleanup()
+        self.__init__(self.headless)
+        await self._boot()
+
+    # -------------------------
+    # Network Control
+    # -------------------------
+
+    async def _blockers(self, context: BrowserContext):
+        async def route(route):
             req = route.request
             url = req.url.lower()
-            resource = req.resource_type
 
-            # Block by Resource Type (Speed)
-            if resource in BLOCKED_RESOURCES:
-                await route.abort()
-                return
+            if req.resource_type in BLOCKED_RESOURCES:
+                return await route.abort()
 
-            # Block by URL Keywords (Ads/Trackers)
-            if any(key in url for key in AD_KEYWORDS):
-                await route.abort()
-                return
+            if any(k in url for k in AD_KEYWORDS):
+                return await route.abort()
 
             await route.continue_()
 
-        # Apply routing to all pages in this context
-        await context.route("**/*", route_handler)
+        await context.route("**/*", route)
 
-    async def _activate_smart_popup_killer(self, context: BrowserContext):
-        """
-        Monitors new tabs. 
-        - Closes them if they look like Ads/Spam.
-        - Keeps them if they are Trusted File Hosts (Redirects).
-        """
-        async def on_new_page(page: Page):
+    async def _popup_guard(self, context: BrowserContext):
+        async def on_page(page: Page):
             try:
-                # Wait briefly for URL/Title to initialize
-                try:
-                    await page.wait_for_load_state("domcontentloaded", timeout=3000)
-                except: pass 
-
-                if page.is_closed(): return
-                
+                await page.wait_for_load_state("domcontentloaded", timeout=3000)
                 url = page.url.lower()
-                
-                # ALLOW: Trusted Hosts (Good Redirects)
-                if any(host in url for host in TRUSTED_FILE_HOSTS):
-                    # print(f"✅ Allowed Download Redirect: {url[:50]}...")
-                    return 
 
-                # BLOCK: Ads, Blank pages, or Suspicious Keywords
-                if any(k in url for k in AD_KEYWORDS) or url == "about:blank":
-                    # print(f"🛡️ Blocked Popup: {url[:50]}...")
+                if any(h in url for h in TRUSTED_HOSTS):
+                    return
+
+                if url == "about:blank" or any(k in url for k in AD_KEYWORDS):
                     await page.close()
-                else:
-                    # Optional: Close unknown popups too if you want strict mode
-                    # await page.close()
-                    pass
+
             except Exception:
-                # If we can't inspect the page (crashed/lagged), close it safety
-                if not page.is_closed(): await page.close()
+                if not page.is_closed():
+                    await page.close()
 
-        context.on("page", on_new_page)
+        context.on("page", on_page)
 
-    async def _apply_advanced_stealth(self, context: BrowserContext):
-        """Injects JS to mask the bot as a real human browser."""
-        stealth_scripts = [
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})",
-            "window.chrome = { runtime: {} };",
-            "Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });",
-            "Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });",
-            # Mock Permissions API
-            """
-            const originalQuery = window.navigator.permissions.query;
-            window.navigator.permissions.query = (parameters) => (
-                parameters.name === 'notifications' ?
-                Promise.resolve({ state: Notification.permission }) :
-                originalQuery(parameters)
-            );
-            """
+    # -------------------------
+    # Stealth & Humanization
+    # -------------------------
+
+    async def _stealth(self, context: BrowserContext):
+        scripts = [
+            "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})",
+            "window.chrome={runtime:{}}",
+            "Object.defineProperty(navigator,'languages',{get:()=>['en-US','en']})",
+            "Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3,4,5]})"
         ]
-        for script in stealth_scripts:
-            await context.add_init_script(script)
+        for s in scripts:
+            await context.add_init_script(s)
 
-    async def _inject_auto_consent(self, context: BrowserContext):
-        """
-        Injects a universal script to automatically click 'Accept'/'Agree' buttons
-        for cookies and GDPR popups.
-        """
-        js_auto_clicker = """
+    async def _humanize(self, page: Page):
+        await page.add_init_script(
+            f"""
+            (() => {{
+                const delay = ms => new Promise(r => setTimeout(r, ms));
+                document.addEventListener('click', async () => {{
+                    await delay({random.randint(30,80)});
+                }});
+            }})();
+            """
+        )
+
+    async def _auto_consent(self, context: BrowserContext):
+        await context.add_init_script("""
             setInterval(() => {
-                const selectors = [
-                    'button:has-text("Reject all")', 
-                    'button:has-text("Accept all")',
-                    '[aria-label="Accept all"]',
-                    '#onetrust-accept-btn-handler',
-                    '.fc-cta-consent', 
-                    '.cc-btn.cc-accept',
-                    'button[class*="agree"]',
-                    'button[class*="accept"]',
-                    'button[class*="consent"]'
-                ];
-
-                selectors.forEach(sel => {
-                    const els = document.querySelectorAll(sel);
-                    els.forEach(el => {
-                        if (el.offsetParent !== null && !el.disabled) {
-                            el.click();
-                        }
-                    });
+                const words = ['accept','agree','consent','allow'];
+                document.querySelectorAll('button').forEach(b=>{
+                    const t=(b.innerText||'').toLowerCase();
+                    if(words.some(w=>t.includes(w)) && t.length<20) b.click();
                 });
-                
-                // Text-based fallback
-                const buttons = Array.from(document.querySelectorAll('button, a'));
-                buttons.forEach(b => {
-                    const t = b.innerText.toLowerCase();
-                    if ((t.includes('accept') || t.includes('agree') || t.includes('i understand')) && t.length < 20) {
-                        b.click();
-                    }
-                });
-            }, 1000);
-        """
-        await context.add_init_script(js_auto_clicker)
+            }, 1200);
+        """)
 
-    async def _clean_unnecessary_data(self, context: BrowserContext):
-        """
-        Uses Chrome DevTools Protocol (CDP) to wipe cache and service workers
-        before closing, keeping the server clean.
-        """
+    # -------------------------
+    # Cleanup
+    # -------------------------
+
+    async def _cleanup(self):
         try:
-            # Get a page to access the CDP session
-            page = context.pages[0] if context.pages else await context.new_page()
-            client = await context.new_cdp_session(page)
-            
-            # 1. Clear Browser Cache (Images, Scripts, CSS)
-            await client.send("Network.clearBrowserCache")
-            
-            # 2. Unregister Service Workers (Often used by ads/trackers)
-            await client.send("ServiceWorker.stopAllWorkers")
-            
-            # Note: We do NOT clear cookies here to allow session persistence if needed later
-            # await client.send("Network.clearBrowserCookies")
-            
+            if self.context:
+                await self.context.close()
+            if self.browser:
+                await self.browser.close()
+            if self.playwright:
+                await self.playwright.stop()
         except Exception:
-            pass # Ignore errors during cleanup
+            pass
 
-# Helper function for easy import
+    # -------------------------
+    # Utils
+    # -------------------------
+
+    def _random_ua(self):
+        return random.choice([
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/119.0.0.0",
+        ])
+
+
+# =========================
+# PUBLIC ENTRY (UNCHANGED)
+# =========================
+
 def get_safe_browser():
     return SafeBrowser()
