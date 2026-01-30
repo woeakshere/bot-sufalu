@@ -24,9 +24,10 @@ from bot.handlers import (
 from utils.memory_manager import start_memory_manager
 
 # --- SILENT LOGGING SETUP ---
+# We keep this minimal to save disk space on cloud logs
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.WARNING, # Hide INFO logs to save disk/RAM
+    level=logging.WARNING, 
     handlers=[logging.StreamHandler()]
 )
 
@@ -40,7 +41,7 @@ logging.getLogger("pymongo").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-# --- HEALTH CHECK SERVER ---
+# --- HEALTH CHECK SERVER (For Koyeb/Render) ---
 app = FastAPI()
 
 @app.get("/")
@@ -53,7 +54,7 @@ async def health_check():
     }
 
 def run_web_server():
-    """Runs the lightweight web server to satisfy Cloud Health Checks."""
+    """Runs the lightweight web server in a background thread."""
     uvicorn.run(app, host="0.0.0.0", port=Config.PORT, log_level="critical")
 
 # --- MAIN BOT EXECUTION ---
@@ -65,7 +66,7 @@ def main():
     # 2. Validate Token
     if not Config.BOT_TOKEN:
         logger.error("❌ BOT_TOKEN not found! Check your environment variables.")
-        time.sleep(3600) # Sleep to prevent crash loop
+        time.sleep(3600) # Sleep to prevent rapid crash loops
         return
 
     # 3. Initialize Bot
