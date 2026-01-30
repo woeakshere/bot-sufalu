@@ -9,108 +9,98 @@ import signal
 logger = logging.getLogger(__name__)
 
 class MemoryManager:
-    def __init__(self, safe_limit_percent=85, critical_limit_percent=95):
+    def __init__(self):
         self.running = False
         
-        # Lazy load psutil to get system stats immediately
-        import psutil
-        total_mem = psutil.virtual_memory().total
+        # 🔒 HARDCODED SAFETY LIMITS (Crucial for Koyeb Free Tier)
+        # We assume 512MB Total. We start cleaning at ~350MB to be safe.
+        # If we rely on psutil.virtual_memory().total, it will report the SERVER'S 64GB RAM,
+        # causing the bot to think it has infinite memory -> OOM Crash.
+        self.total_mem_limit = 512 * 1024 * 1024
         
-        # Calculate thresholds dynamically based on real container size
-        self.safe_limit = total_mem * (safe_limit_percent / 100)
-        self.critical_limit = total_mem * (critical_limit_percent / 100)
+        # Thresholds:
+        # Safe (70%): Trigger Python Garbage Collection
+        self.safe_limit = self.total_mem_limit * 0.70     # ~358 MB
         
-        logger.warning(f"🧠 Memory Manager Initialized: Limit={self.safe_limit / 1024**2:.0f}MB")
+        # Critical (85%): Kill heavy sub-processes (Chrome/FFmpeg)
+        self.critical_limit = self.total_mem_limit * 0.85 # ~435 MB
+        
+        logger.warning(f"🧠 Memory Governance: Active (Limit={self.total_mem_limit/1024**2:.0f}MB)")
 
     async def start(self):
         """Starts the background monitoring loop."""
         self.running = True
-        logger.info("🧠 Memory Monitor Active")
-        
         while self.running:
             try:
                 await self.health_check()
-                # Run checks every 30 seconds (More frequent = Safer)
-                await asyncio.sleep(30)
+                # Check every 15s (Aggressive checks prevent OOM kills)
+                await asyncio.sleep(15)
             except Exception as e:
                 logger.error(f"Memory Loop Error: {e}")
-                await asyncio.sleep(30)
+                await asyncio.sleep(15)
 
     async def health_check(self):
-        """Performs graduated cleanup based on severity."""
         try:
             import psutil
             process = psutil.Process(os.getpid())
             mem_usage = process.memory_info().rss
             
-            # LEVEL 1: Routine Maintenance (Always Run)
-            gc.collect()
-
-            # LEVEL 2: Warning Zone (Usage > 85%)
+            # 1. Light Cleanup (Always run if getting full)
             if mem_usage > self.safe_limit:
-                logger.warning(f"⚠️ High RAM ({mem_usage / 1024**2:.1f}MB). Aggressive GC...")
-                gc.collect(generation=2) 
-                
-            # LEVEL 3: CRITICAL ZONE (Usage > 95%) - THE NUCLEAR OPTION
+                gc.collect()
+
+            # 2. Critical Cleanup (Kill Heavy Processes)
+            # If we are close to the 512MB cliff, kill the heaviest process immediately.
             if mem_usage > self.critical_limit:
-                logger.error("🚨 CRITICAL MEMORY! KILLING BROWSERS & ENCODERS...")
+                logger.warning(f"🚨 RAM CRITICAL ({mem_usage/1024**2:.1f}MB)! Killing Chrome/FFmpeg...")
                 self.kill_process_by_name("chrome")
                 self.kill_process_by_name("ffmpeg")
-                self.kill_process_by_name("aria2c") # Last resort: Restart Aria2
+                # Force a hard collection after killing
+                gc.collect()
                 
-            # LEVEL 4: Cleanup Stuck Scrapers (Zombie Hunter)
-            # Kills any 'chrome' process older than 5 minutes (Scrapers shouldn't run that long)
-            self.kill_zombies("chrome", max_age_seconds=300) 
+            # 3. Zombie Hunter (Stuck Scrapers)
+            # Kill any chrome process older than 2 minutes (scrapers should be fast now)
+            self.kill_zombies("chrome", max_age_seconds=120) 
             
-            # LEVEL 5: Disk Hygiene
+            # 4. Disk Hygiene
             self.clean_stuck_downloads()
 
-        except ImportError:
-            pass # psutil missing
         except Exception as e:
             logger.error(f"Health Check Failed: {e}")
 
     def kill_process_by_name(self, name):
-        """Force kills all processes with a specific name."""
+        """Kills any process matching the name (e.g., 'chrome')."""
         import psutil
-        count = 0
         for proc in psutil.process_iter(['pid', 'name']):
             try:
                 if name.lower() in proc.info['name'].lower():
                     proc.kill()
-                    count += 1
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
-        if count > 0:
-            logger.warning(f"🔪 Killed {count} '{name}' processes to free RAM.")
 
     def kill_zombies(self, name, max_age_seconds):
-        """Kills specific processes that have been running too long (Stuck)."""
+        """Kills processes that have been running too long."""
         import psutil
         current_time = time.time()
         for proc in psutil.process_iter(['pid', 'name', 'create_time']):
             try:
                 if name.lower() in proc.info['name'].lower():
-                    runtime = current_time - proc.info['create_time']
-                    if runtime > max_age_seconds:
-                        logger.warning(f"🧟 Killed Zombie '{name}' (Running for {int(runtime)}s)")
+                    if (current_time - proc.info['create_time']) > max_age_seconds:
+                        logger.warning(f"🧟 Killed Zombie {name} (Running too long)")
                         proc.kill()
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
 
     def clean_stuck_downloads(self):
-        """Deletes files in ./downloads that are older than 2 hours."""
+        """Deletes files in ./downloads that are older than 3 hours."""
         download_path = "./downloads"
-        max_age = 2 * 60 * 60 
-        current_time = time.time()
-
         if os.path.exists(download_path):
+            current_time = time.time()
             for f in os.listdir(download_path):
                 f_path = os.path.join(download_path, f)
                 try:
-                    # Check if file is modified recently (Active download?)
-                    # If last modified > 2 hours ago, it's definitely stuck.
-                    if os.stat(f_path).st_mtime < (current_time - max_age):
+                    # Delete files older than 3 hours (10800 seconds)
+                    if os.stat(f_path).st_mtime < (current_time - 10800):
                         if os.path.isfile(f_path): os.remove(f_path)
                         elif os.path.isdir(f_path): shutil.rmtree(f_path)
                         logger.warning(f"♻️ Cleaned junk: {f}")
