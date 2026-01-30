@@ -1,23 +1,25 @@
 import motor.motor_asyncio
 import re
 import logging
+import asyncio
+from datetime import datetime
+from functools import lru_cache
 from config import Config
 
 logger = logging.getLogger(__name__)
 
 class MongoDB:
     def __init__(self):
-        # 1. Check if URL is provided
+        self.client = None
+        self.db = None
+        self.users = None
+        self.history = None
+
         if not Config.MONGO_URL:
-            logger.warning("MONGO_URL not found! Database features will be disabled.")
-            self.client = None
-            self.db = None
+            logger.warning("MONGO_URL not found! DB features disabled.")
             return
 
         try:
-            # 2. Initialize Connection (OPTIMIZED FOR FREE TIER)
-            # maxPoolSize=1: Restricts connection pool to save massive amounts of RAM.
-            # serverSelectionTimeoutMS=5000: Fails fast (5s) if DB is down, preventing bot hang.
             self.client = motor.motor_asyncio.AsyncIOMotorClient(
                 Config.MONGO_URL,
                 maxPoolSize=1,
@@ -25,37 +27,50 @@ class MongoDB:
                 serverSelectionTimeoutMS=5000
             )
             self.db = self.client[Config.DB_NAME]
-            
-            # 3. Define Collections
             self.users = self.db.users
             self.history = self.db.history
-
-            # 4. Create Index (Critical for speed)
-            # Ensures searching for "One Piece" is instant and doesn't scan the whole DB
-            self.history.create_index([("user_id", 1), ("anime", 1)], unique=True, background=True)
-            logger.info("✅ Connected to MongoDB successfully.")
-            
+            logger.info("✅ MongoDB client initialized.")
         except Exception as e:
-            logger.error(f"Failed to connect to MongoDB: {e}")
-            self.client = None
-            self.db = None
+            logger.error(f"Failed to connect MongoDB: {e}")
 
-    # --- STATS & TRAFFIC ---
+    async def init_indexes(self):
+        """Async-safe index creation with TTL cleanup"""
+        if not self.db:
+            return
+        try:
+            # Unique per user + anime
+            await self.history.create_index(
+                [("user_id", 1), ("anime", 1)], unique=True, background=True
+            )
+            # Optional TTL for auto cleanup: 30 days
+            await self.history.create_index(
+                [("last_updated", 1)],
+                expireAfterSeconds=30*24*3600  # 30 days
+            )
+            logger.info("✅ MongoDB indexes created.")
+        except Exception as e:
+            logger.error(f"Failed to create indexes: {e}")
 
+    # --- Connection Health ---
+    async def ping(self):
+        if not self.client:
+            return False
+        try:
+            await self.client.admin.command("ping")
+            return True
+        except:
+            return False
+
+    # --- Stats & Traffic ---
     async def get_total_users(self):
-        """Returns the number of unique users using the bot."""
-        if self.db is None: 
-            return 0
+        if not self.db: return 0
         return await self.users.count_documents({})
 
     async def get_total_traffic(self):
-        """Calculates total Download/Upload bytes across all users."""
-        if self.db is None: 
-            return 0, 0
-            
+        if not self.db: return 0, 0
         pipeline = [
             {"$group": {
-                "_id": None, 
+                "_id": None,
                 "total_down": {"$sum": "$downloaded"},
                 "total_up": {"$sum": "$uploaded"}
             }}
@@ -63,58 +78,45 @@ class MongoDB:
         try:
             result = await self.users.aggregate(pipeline).to_list(length=1)
             if result:
-                return result[0]['total_down'], result[0]['total_up']
+                return result[0].get('total_down', 0), result[0].get('total_up', 0)
         except Exception as e:
-            logger.error(f"Error fetching traffic stats: {e}")
+            logger.error(f"Error fetching traffic: {e}")
         return 0, 0
 
     async def update_stats(self, user_id, bytes_downloaded=0, bytes_uploaded=0):
-        """Updates traffic stats for a specific user."""
-        if self.db is None: 
-            return
-            
+        if not self.db: return
         await self.users.update_one(
             {"user_id": user_id},
-            {"$inc": {"downloaded": bytes_downloaded, "uploaded": bytes_uploaded}},
+            {
+                "$inc": {"downloaded": bytes_downloaded, "uploaded": bytes_uploaded},
+                "$setOnInsert": {"thumbnail": None}
+            },
             upsert=True
         )
 
-    # --- WATCH HISTORY & NEXT EPISODE ---
-
+    # --- History & Episodes ---
     async def add_history(self, user_id, file_name):
-        """
-        Parses filename to extract Anime Name & Episode Number.
-        Updates DB and returns the parsed info.
-        """
-        if self.db is None: 
+        if not self.db:
             return None, None
-            
-        # Regex to find "Anime Name - 12" pattern
-        # Handles "[Group] Anime - 12 [1080p].mkv"
-        match = re.search(r"(?:\[.*?\]\s*)?(.*?)\s*-\s*(\d+)", file_name)
-        
+
+        # Supports "Anime - 12", "Anime.S01E12", "[Group] Anime - 12v2"
+        match = re.search(
+            r"(?:\[.*?\]\s*)?(.*?)\s*[-. ](?:S\d+E)?(\d+)",
+            file_name, re.IGNORECASE
+        )
         if match:
             anime_name = match.group(1).strip()
             episode = int(match.group(2))
-            
-            # Upsert: Create if doesn't exist, Update if it does
             await self.history.update_one(
                 {"user_id": user_id, "anime": anime_name},
-                {"$set": {"last_ep": episode}},
+                {"$set": {"last_ep": episode, "last_updated": datetime.utcnow()}},
                 upsert=True
             )
             return anime_name, episode
-            
         return None, None
 
     async def delete_history(self, user_id, anime_name):
-        """
-        Deletes a specific anime from history.
-        Used for the 'Auto-Cleanup' feature.
-        """
-        if self.db is None: 
-            return False
-            
+        if not self.db: return False
         try:
             await self.history.delete_one({"user_id": user_id, "anime": anime_name})
             return True
@@ -122,24 +124,29 @@ class MongoDB:
             logger.error(f"Failed to delete history for {anime_name}: {e}")
             return False
 
-    # --- CUSTOM THUMBNAILS (NEW) ---
+    async def increment_episode(self, user_id, anime_name):
+        if not self.db: return
+        await self.history.update_one(
+            {"user_id": user_id, "anime": anime_name},
+            {"$inc": {"last_ep": 1}, "$set": {"last_updated": datetime.utcnow()}},
+            upsert=True
+        )
+
+    # --- Thumbnails with LRU Cache ---
+    @lru_cache(maxsize=128)
+    async def get_thumbnail(self, user_id):
+        if not self.db: return None
+        user = await self.users.find_one({"user_id": user_id})
+        return user.get("thumbnail") if user else None
 
     async def set_thumbnail(self, user_id, photo_binary):
-        """Saves a user's custom thumbnail (bytes) to the database."""
-        if self.db is None: return
-        
+        if not self.db: return
         await self.users.update_one(
             {"user_id": user_id},
             {"$set": {"thumbnail": photo_binary}},
             upsert=True
         )
 
-    async def get_thumbnail(self, user_id):
-        """Retrieves a user's custom thumbnail."""
-        if self.db is None: return None
-        
-        user = await self.users.find_one({"user_id": user_id})
-        return user.get("thumbnail") if user else None
-
-# Create the instance
+# --- CREATE SINGLETON INSTANCE ---
 db = MongoDB()
+asyncio.create_task(db.init_indexes())
