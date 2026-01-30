@@ -256,7 +256,7 @@ async def search(update, context):
     for name, task in scrapers:
         if res: break
         try:
-            res = await asyncio.wait_for(task, timeout=10)
+            res = await asyncio.wait_for(task, timeout=25)
             if res:
                 logger.info(f"Scraper '{name}' succeeded.")
         except Exception:
