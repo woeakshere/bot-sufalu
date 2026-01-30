@@ -11,7 +11,7 @@ from telegram.ext import ContextTypes
 from scrapers.common_scraper import CommonAnimeScraper
 from scrapers.gogoanime3 import scrape_gogoanime
 from scrapers.animixplay import scrape_animixplay
-# Fixed Import: IntelligentScraper is inside allanime.py
+# IntelligentScraper is located in allanime.py based on your upload
 from scrapers.allanime import IntelligentScraper 
 
 # --- CORE IMPORTS ---
@@ -45,7 +45,7 @@ def human_readable_size(size, decimal_places=2):
     return f"{size:.{decimal_places}f} PB"
 
 async def async_delete(path):
-    """Non-blocking delete to avoid freezing bot"""
+    """Non-blocking delete to avoid freezing bot during cleanup."""
     if not path or not os.path.exists(path): return
     try:
         if os.path.isfile(path):
@@ -130,7 +130,8 @@ async def monitor_and_process_download(gid, update, context, status_msg):
                 # Update progress sparingly to avoid ratelimit
                 if int(float(status['progress'])) % 5 == 0:
                     await status_msg.edit_text(
-                        f"📥 **{status['progress']}%** | 🚀 `{status['speed']}`",
+                        f"📥 **{status['progress']}%**\n"
+                        f"🚀 `{status['speed']}` | ⏳ `{status.get('eta', 'N/A')}`",
                         reply_markup=cancel_btn, parse_mode="Markdown"
                     )
             except: pass
@@ -307,9 +308,6 @@ async def button_callback(update, context):
         except Exception as e:
             logger.error(f"Episode fetch error: {e}")
 
-        # If normal fetch fails, we can't do much here for batching, 
-        # unless we want to try AllAnime resolution immediately, 
-        # but AllAnime resolution is per-episode.
         if not episodes:
              await q.edit_message_text("❌ Could not fetch episode list. Try another source.")
              return
@@ -344,9 +342,7 @@ async def button_callback(update, context):
             ep_url = ep["url"]
             ep_title = ep["title"]
             
-            # Modify URL for sub/dub if possible (naive attempt)
-            # Note: This usually requires specific scraper support, 
-            # but we pass it anyway in case the resolver uses it.
+            # Modify URL for sub/dub if possible
             if "sub" in selected_quality: ep_url += "?sub=1"
             elif "dub" in selected_quality: ep_url += "?dub=1"
 
