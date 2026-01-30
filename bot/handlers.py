@@ -4,8 +4,8 @@ import logging
 import time
 import traceback
 import asyncio
-import sys # <--- Required for restarting
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import sys
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, error as tg_error
 from telegram.ext import ContextTypes
 
 # --- SCRAPER IMPORTS ---
@@ -18,72 +18,65 @@ from scrapers.allanime import AnimeBot
 from downloader.torrent import TorrentDownloader
 from database.mongo import db
 from config import Config
+from utils.memory_manager import start_memory_manager
 
 # --- LOGGING ---
 logging.basicConfig(
-    level=logging.WARNING, 
+    level=logging.WARNING,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[logging.StreamHandler()]
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("pymongo").setLevel(logging.WARNING)
-
 logger = logging.getLogger(__name__)
 
 downloader = TorrentDownloader()
 BOT_START_TIME = time.time()
 
-# --- WORKER STATE (Recycling Counter) ---
-JOBS_PROCESSED = 0 
+# --- WORKER STATE ---
+JOBS_PROCESSED = 0
+JOB_LOCK = asyncio.Lock()
 
 # --- HELPER FUNCTIONS ---
-def get_progress_bar(percentage, length=10):
-    try:
-        if isinstance(percentage, str): percentage = float(percentage.replace('%', ''))
-        filled = int(length * percentage // 100)
-        return "▰" * filled + "▱" * (length - filled)
-    except: return "▱" * length
-
 def human_readable_size(size, decimal_places=2):
     for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
         if size < 1024.0: return f"{size:.{decimal_places}f} {unit}"
         size /= 1024.0
     return f"{size:.{decimal_places}f} PB"
 
-def get_uptime():
-    seconds = int(time.time() - BOT_START_TIME)
-    minutes, seconds = divmod(seconds, 60)
-    hours, minutes = divmod(minutes, 60)
-    days, hours = divmod(hours, 24)
-    return f"{days}d {hours}h {minutes}m {seconds}s"
+async def async_delete(path):
+    """Non-blocking delete to avoid freezing bot"""
+    if not path or not os.path.exists(path): return
+    try:
+        if os.path.isfile(path):
+            await asyncio.to_thread(os.remove, path)
+        elif os.path.isdir(path):
+            await asyncio.to_thread(shutil.rmtree, path)
+    except Exception as e:
+        logger.warning(f"Failed to delete {path}: {e}")
 
 async def send_error_log(update, context, error_msg):
     try:
         log_content = f"⚠️ Error:\n{error_msg}\n\nTrace:\n{traceback.format_exc()}"
         with open("error_log.txt", "w", encoding="utf-8") as f:
             f.write(log_content)
-        
         chat_id = update.effective_chat.id if update.effective_chat else Config.CHANNEL_ID
         with open("error_log.txt", "rb") as f:
             await context.bot.send_document(chat_id=chat_id, document=f, caption="⚠️ **Error Log**")
-        os.remove("error_log.txt")
-    except: pass
+        await async_delete("error_log.txt")
+    except Exception as e:
+        logger.warning(f"Failed to send error log: {e}")
 
 # --- COMMANDS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🚀 **Leech Bot Active**\n\n"
-        "/search <name> - Find anime\n"
-        "/torrent <link> - Direct download\n"
-        "/setthumb - Set custom thumbnail\n"
-        "/stats - Server health", 
+        "🚀 **Leech Bot Active**\n/search <name>\n/torrent <link>\n/stats",
         parse_mode="Markdown"
     )
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("🔄 Checking...")
-    import psutil 
-    
+    import psutil
     cpu = psutil.cpu_percent()
     ram = psutil.virtual_memory()
     total_users = await db.get_total_users()
@@ -100,169 +93,142 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def set_thumb_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.reply_to_message or not update.message.reply_to_message.photo:
-        return await update.message.reply_text("❌ Reply to a photo to set it as thumbnail.")
-    
+        return await update.message.reply_text("❌ Reply to a photo.")
     msg = await update.message.reply_text("⬇️ Downloading...")
     photo = await update.message.reply_to_message.photo[-1].get_file()
     photo_bytes = await photo.download_as_bytearray()
-    
     await db.set_thumbnail(update.effective_user.id, photo_bytes)
-    await msg.edit_text("✅ **Thumbnail Saved!**", parse_mode="Markdown")
+    await msg.edit_text("✅ **Saved!**", parse_mode="Markdown")
 
-# --- ADMIN COMMANDS ---
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in Config.ADMIN_IDS: return
-
-    if not context.args:
-        return await update.message.reply_text("❌ Usage: `/broadcast <message>`")
-
-    msg = " ".join(context.args)
-    status_msg = await update.message.reply_text("📢 **Broadcasting...**", parse_mode="Markdown")
+    if update.effective_user.id not in Config.ADMIN_IDS: return
+    if not context.args: return await update.message.reply_text("❌ Usage: `/broadcast <msg>`")
     
-    cursor = db.users.find({})
-    total, success, blocked = 0, 0, 0
-
-    async for user in cursor:
+    msg = " ".join(context.args)
+    status = await update.message.reply_text("📢 **Sending...**", parse_mode="Markdown")
+    total, success = 0, 0
+    async for user in db.users.find({}):
         total += 1
         try:
-            await context.bot.send_message(chat_id=user['user_id'], text=f"📢 **Announcement:**\n\n{msg}", parse_mode="Markdown")
+            await context.bot.send_message(user['user_id'], f"📢 **Announcement:**\n\n{msg}", parse_mode="Markdown")
             success += 1
-            await asyncio.sleep(0.05) 
-        except Exception:
-            blocked += 1
-    
-    await status_msg.edit_text(f"✅ **Done**\nTotal: `{total}`\nSent: `{success}`\nBlocked: `{blocked}`", parse_mode="Markdown")
+            await asyncio.sleep(0.05)
+        except: pass
+    await status.edit_text(f"✅ **Done** ({success}/{total})", parse_mode="Markdown")
 
 # --- CORE LOGIC ---
 async def monitor_and_process_download(gid, update, context, status_msg):
-    # Access Global Job Counter
-    global JOBS_PROCESSED 
+    global JOBS_PROCESSED
+    created_files = []
+    base_path = None
 
     try:
-        cancel_btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Task", callback_data=f"cancel_{gid}")]])
+        cancel_btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{gid}")]])
 
         async def progress_callback(status):
             try:
-                p = status['progress']
-                if int(float(p)) % 5 == 0: 
+                if int(float(status['progress'])) % 5 == 0:
                     await status_msg.edit_text(
-                        f"📥 **Downloading...** {p}%\n"
-                        f"🚀 `{status['speed']}` | ⏳ `{status.get('eta', 'N/A')}`",
-                        reply_markup=cancel_btn,
-                        parse_mode="Markdown"
+                        f"📥 **{status['progress']}%** | 🚀 `{status['speed']}`",
+                        reply_markup=cancel_btn, parse_mode="Markdown"
                     )
             except: pass
 
         await downloader.wait_for_completion(gid, callback=progress_callback)
-
         status = await downloader.get_status(gid)
+
         if status and status["status"] == "complete":
-            await status_msg.edit_text("✅ Downloaded. Processing...")
+            await status_msg.edit_text("✅ Processing...")
             base_path = f"./downloads/{status['name']}"
-            user_id = update.effective_user.id
-            
-            if os.path.exists(base_path):
-                files = []
-                if os.path.isfile(base_path): files.append(base_path)
-                else:
-                    for r, _, f in os.walk(base_path):
-                        for file in f:
-                            if file.lower().endswith(('.mkv', '.mp4', '.avi', '.webm')):
-                                files.append(os.path.join(r, file))
-                    files.sort()
+            created_files.append(base_path)
 
-                if not files:
-                    await status_msg.edit_text("⚠️ No video files.")
-                    if os.path.isdir(base_path): shutil.rmtree(base_path)
-                    return
-
-                await status_msg.edit_text(f"Found {len(files)} files.")
-                thumb_data = await db.get_thumbnail(user_id)
-                last_anime, last_ep = None, None
-
-                for idx, v_path in enumerate(files):
-                    fname = os.path.basename(v_path)
-                    final_path = v_path
-                    sub_path = None
-                    
-                    # Subtitle Check
-                    base = os.path.splitext(v_path)[0]
-                    for ext in [".srt", ".vtt", ".ass"]:
-                        if os.path.exists(base + ext):
-                            sub_path = base + ext
-                            break
-                    
-                    if sub_path:
-                        try:
-                            from processor.muxer import mux_subtitles
-                            await status_msg.edit_text(f"🛠️ **Muxing...**")
-                            out_muxed = base + "_muxed" + os.path.splitext(v_path)[1]
-                            if mux_subtitles(v_path, sub_path, out_muxed):
-                                final_path = out_muxed
-                                fname = os.path.basename(final_path)
-                        except ImportError: pass
-
-                    # Upload
-                    try:
-                        await status_msg.edit_text(f"⬆️ **Uploading ({idx+1}/{len(files)})**")
-                        with open(final_path, 'rb') as doc:
-                            await context.bot.send_document(
-                                Config.CHANNEL_ID, 
-                                document=doc, 
-                                caption=f"📂 `{fname}`", 
-                                thumbnail=thumb_data,
-                                parse_mode="Markdown"
-                            )
-                        
-                        anime, ep = await db.add_history(user_id, fname)
-                        if anime: last_anime, last_ep = anime, ep
-                        fsize = os.path.getsize(final_path)
-                        await db.update_stats(user_id, fsize, fsize)
-                        
-                        if idx == len(files) - 1 and len(files) > 1 and last_anime:
-                            await db.delete_history(user_id, last_anime)
-                            last_anime = None
-                            
-                        if os.path.exists(final_path): os.remove(final_path)
-                        if final_path != v_path and os.path.exists(v_path): os.remove(v_path)
-                        if sub_path and os.path.exists(sub_path): os.remove(sub_path)
-                    except Exception as e:
-                        logger.error(f"Upload failed: {e}")
-                
-                if os.path.isdir(base_path): shutil.rmtree(base_path)
-                
-                # --- WORKER RECYCLING LOGIC ---
-                if Config.WORKER_TTL > 0:
-                    JOBS_PROCESSED += 1
-                    logger.info(f"✅ Job Done. Worker State: {JOBS_PROCESSED}/{Config.WORKER_TTL}")
-                    
-                    if JOBS_PROCESSED >= Config.WORKER_TTL:
-                        await status_msg.reply_text("♻️ **Scheduled Maintenance**\nRestarting worker to clear memory...", parse_mode="Markdown")
-                        logger.warning(f"♻️ TTL Reached ({Config.WORKER_TTL}). Restarting...")
-                        await asyncio.sleep(2)
-                        os._exit(0) # Triggers Docker Restart
-
-                # Final Success Message (If not restarting)
-                txt = "✅ **Done!**"
-                if last_anime and last_ep:
-                    txt += f"\n\n📺 **Tracked**: {last_anime} (Ep {last_ep})"
-                    btn = [[InlineKeyboardButton(f"⏭️ Ep {last_ep+1}", callback_data=f"next_{last_anime} {last_ep+1}")]]
-                    await status_msg.edit_text(txt, reply_markup=InlineKeyboardMarkup(btn), parse_mode="Markdown")
-                else:
-                    await status_msg.edit_text(txt, parse_mode="Markdown")
-
+            # Discover video files
+            video_files = []
+            if os.path.isfile(base_path): video_files.append(base_path)
             else:
-                await status_msg.edit_text("❌ File missing.")
-        
+                for r, _, f in os.walk(base_path):
+                    for file in f:
+                        if file.lower().endswith(('.mkv', '.mp4', '.avi')):
+                            video_files.append(os.path.join(r, file))
+            video_files.sort()
+
+            if not video_files:
+                return await status_msg.edit_text("⚠️ No video files.")
+
+            await status_msg.edit_text(f"Found {len(video_files)} files.")
+            thumb_data = await db.get_thumbnail(update.effective_user.id)
+            last_anime, last_ep = None, None
+
+            for idx, v_path in enumerate(video_files):
+                fname = os.path.basename(v_path)
+                final_path = v_path
+
+                # Subtitle muxing (.srt, .vtt, .ass)
+                base = os.path.splitext(v_path)[0]
+                sub_path = next((base + ext for ext in [".srt", ".vtt", ".ass"] if os.path.exists(base + ext)), None)
+                if sub_path: created_files.append(sub_path)
+
+                if sub_path:
+                    try:
+                        from processor.muxer import mux_subtitles
+                        out_muxed = base + "_muxed" + os.path.splitext(v_path)[1]
+                        created_files.append(out_muxed)
+                        if mux_subtitles(v_path, sub_path, out_muxed):
+                            final_path = out_muxed
+                            fname = os.path.basename(final_path)
+                    except Exception as e:
+                        logger.warning(f"Muxing failed: {e}")
+
+                # Upload with retries
+                sent_msg = None
+                for attempt in range(3):
+                    try:
+                        await status_msg.edit_text(f"⬆️ Uploading ({idx+1}/{len(video_files)}) | Attempt {attempt+1}/3")
+                        with open(final_path, 'rb') as doc:
+                            sent_msg = await context.bot.send_document(
+                                Config.CHANNEL_ID, document=doc, caption=f"📂 `{fname}`",
+                                thumbnail=thumb_data, parse_mode="Markdown"
+                            )
+                        break
+                    except tg_error.NetworkError:
+                        await asyncio.sleep(2 * (attempt + 1))
+                    except Exception as e:
+                        logger.error(f"Upload Error: {e}")
+                        break
+
+                if sent_msg:
+                    anime, ep = await db.add_history(update.effective_user.id, fname)
+                    if anime: last_anime, last_ep = anime, ep
+                    await db.update_stats(update.effective_user.id, os.path.getsize(final_path))
+
+                    if idx == len(video_files) - 1 and len(video_files) > 1 and last_anime:
+                        await db.delete_history(update.effective_user.id, last_anime)
+
+            # Worker Recycling
+            if Config.WORKER_TTL > 0:
+                async with JOB_LOCK:
+                    JOBS_PROCESSED += 1
+                    if JOBS_PROCESSED >= Config.WORKER_TTL:
+                        await status_msg.reply_text("♻️ **Maintenance Restart...**")
+                        await asyncio.sleep(2)
+                        os._exit(0)
+
+            txt = "✅ **Done!**"
+            if last_anime: txt += f"\n📺 {last_anime} (Ep {last_ep})"
+            await status_msg.edit_text(txt, parse_mode="Markdown")
+
         elif status and status["status"] == "removed":
-            await status_msg.edit_text("❌ **Task Cancelled.**", parse_mode="Markdown")
+            await status_msg.edit_text("❌ **Cancelled.**", parse_mode="Markdown")
         else:
-            await status_msg.edit_text("❌ Download failed.")
-            
+            await status_msg.edit_text("❌ Failed.")
+
     except Exception as e:
-        logger.error(f"Critical: {e}")
         await send_error_log(update, context, str(e))
+
+    finally:
+        # Non-blocking cleanup
+        if base_path: await async_delete(base_path)
+        for f in created_files: await async_delete(f)
 
 async def torrent_command(update, context):
     if not context.args: return await update.message.reply_text("❌ `/torrent <link>`")
@@ -276,54 +242,54 @@ async def search(update, context):
     q = " ".join(context.args)
     msg = await update.message.reply_text("🔍 Searching...")
     res = []
-    
-    try: res = await CommonAnimeScraper().run(q)
-    except: pass
-    if not res:
-        try: res = await scrape_gogoanime(q)
-        except: pass
-    if not res:
-        try: res = await AnimeBot().run(q)
-        except: pass
-        
+
+    scrapers = [
+        ("Common", CommonAnimeScraper().run(q)),
+        ("Gogo", scrape_gogoanime(q)),
+        ("Animix", scrape_animixplay(q)),
+        ("AllAnime", AnimeBot().run(q))
+    ]
+
+    for name, task in scrapers:
+        if res: break
+        try:
+            res = await asyncio.wait_for(task, timeout=10)
+            logger.info(f"Scraper '{name}' succeeded with {len(res)} results.")
+        except asyncio.TimeoutError:
+            logger.warning(f"Scraper '{name}' timed out.")
+        except Exception as e:
+            logger.warning(f"Scraper '{name}' failed: {e}")
+
     if not res: return await msg.edit_text("❌ None found.")
-    
+
     kb = []
     for r in res[:10]:
         t = r.get("title", "?")[:40]
-        p = "lnk" if r.get("type") == "link" else "vid"
-        kb.append([InlineKeyboardButton(f"🎬 {t}", callback_data=f"{p}_{r.get('url')}")])
-        
+        kb.append([InlineKeyboardButton(f"🎬 {t}", callback_data=f"vid_{r.get('url')}")])
     await msg.edit_text(f"✅ Results: **{q}**", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
 
 async def button_callback(update, context):
     q = update.callback_query
     await q.answer()
     d = q.data
-    
+
     if d.startswith("vid_"):
         u = d.split("_", 1)[1]
         k = [[InlineKeyboardButton(x, callback_data=f"qual_{x}_{u}")] for x in ["1080p", "720p"]]
         await q.edit_message_text("Select Quality:", reply_markup=InlineKeyboardMarkup(k))
-    
-    elif d.startswith("lnk_"):
-        await context.bot.send_message(Config.CHANNEL_ID, f"🔗 {d.split('_',1)[1]}")
-        await q.edit_message_text("🔗 Sent to channel.")
-    
     elif d.startswith("qual_"):
         u = d.split("_", 2)[-1]
         await q.edit_message_text("⚡ Downloading...")
         gid = await downloader.add_torrent(u)
         if gid: await monitor_and_process_download(gid, update, context, q.message)
-    
-    elif d.startswith("next_"):
-        context.args = d.split("_", 1)[1].split(" ")
-        await search(update, context)
-    
     elif d.startswith("cancel_"):
         gid = d.split("_", 1)[1]
         try:
             await downloader.remove_download(gid)
-            await q.edit_message_text("🛑 **Stopping...**", parse_mode="Markdown")
+            await async_delete(f"./downloads/{gid}")
+            await q.edit_message_text("🛑 **Stopped and cleaned.**", parse_mode="Markdown")
         except Exception as e:
-            await q.edit_message_text(f"❌ Failed to stop: {e}")
+            await q.edit_message_text(f"❌ Failed: {e}", parse_mode="Markdown")
+
+# --- START MEMORY MANAGER ---
+asyncio.get_event_loop().create_task(start_memory_manager())
