@@ -1,18 +1,20 @@
+# gogoanime3.py
 import asyncio
 from utils.safe_browser import get_safe_browser
 
 async def scrape_gogoanime(query):
+    """Search GogoAnime and return top anime results."""
     try:
         async with get_safe_browser() as page:
-            url = f"https://gogoanime3.cv/search.html?keyword={query.replace(' ', '%20')}"
-            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            search_url = f"https://gogoanime3.cv/search.html?keyword={query.replace(' ', '%20')}"
+            await page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
             
             results = []
             try:
                 await page.wait_for_selector(".items li", timeout=10000)
                 anime_elements = await page.query_selector_all(".items li")
                 
-                for element in anime_elements:
+                for element in anime_elements[:10]:  # Top 10 results
                     title_el = await element.query_selector(".name a")
                     link_el = await element.query_selector("a")
                     
@@ -22,19 +24,52 @@ async def scrape_gogoanime(query):
                         if link.startswith("/"):
                             link = f"https://gogoanime3.cv{link}"
                         
-                        # --- PRESET CONFIGURATION ---
-                        result_type = "video" # Default: Quality Menu
-                        # result_type = "link" # Uncomment for Direct Link Bypass
-                        
                         results.append({
-                            "title": title.strip(), 
+                            "title": title.strip(),
                             "url": link,
-                            "type": result_type
+                            "type": "video"  # Indicates episode page
                         })
             except Exception:
                 pass
             
             return results
     except Exception as e:
-        print(f"Gogoanime Error: {e}")
+        print(f"Gogoanime Search Error: {e}")
+        return []
+
+# --- Extract episodes for selected anime ---
+async def get_gogoanime_episodes(anime_url):
+    """
+    Given an anime page, return a list of episodes with URLs.
+    """
+    try:
+        async with get_safe_browser() as page:
+            await page.goto(anime_url, wait_until="domcontentloaded", timeout=60000)
+            await page.wait_for_selector(".episode li a", timeout=10000)
+            
+            ep_elements = await page.query_selector_all(".episode li a")
+            episodes = []
+            
+            for ep in ep_elements:
+                ep_title = await ep.inner_text()
+                ep_link = await ep.get_attribute("href")
+                if ep_link.startswith("/"):
+                    ep_link = f"https://gogoanime3.cv{ep_link}"
+                
+                episodes.append({
+                    "title": ep_title.strip(),
+                    "url": ep_link,
+                    "type": "video"
+                })
+            
+            # Sort episodes numerically if possible
+            def ep_key(e):
+                import re
+                match = re.search(r"\d+", e["title"])
+                return int(match.group()) if match else 0
+            episodes.sort(key=ep_key)
+            
+            return episodes
+    except Exception as e:
+        print(f"Gogoanime Episode Extraction Error: {e}")
         return []
