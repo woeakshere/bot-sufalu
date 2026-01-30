@@ -11,7 +11,7 @@ from telegram.ext import ContextTypes
 from scrapers.common_scraper import CommonAnimeScraper
 from scrapers.gogoanime3 import scrape_gogoanime
 from scrapers.animixplay import scrape_animixplay
-# IntelligentScraper is located in allanime.py based on your upload
+# ✅ FIX: Import from 'allanime' (the actual filename), not 'intelligent_scraper'
 from scrapers.allanime import IntelligentScraper 
 
 # --- CORE IMPORTS ---
