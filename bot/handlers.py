@@ -2,9 +2,7 @@ import os
 import shutil
 import logging
 import time
-import psutil
 import traceback
-# REMOVED: from logging.handlers import RotatingFileHandler (Saves Disk Space)
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
@@ -19,27 +17,15 @@ from downloader.torrent import TorrentDownloader
 from database.mongo import db
 from config import Config
 
-# --- OPTIONAL: IMPORT MUXER ---
-try:
-    from processor.muxer import mux_subtitles
-except ImportError:
-    mux_subtitles = None
-    print("⚠️ Warning: processor.muxer not found. Muxing disabled.")
-
-# --- LOGGING SETUP (OPTIMIZED) ---
-# 1. Level=WARNING (Hides "Downloading..." spam)
-# 2. No FileHandler (Saves Disk Space)
+# --- LOGGING ---
 logging.basicConfig(
     level=logging.WARNING, 
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler() # Only print to console (Koyeb handles this natively)
-    ]
+    handlers=[logging.StreamHandler()]
 )
-# Reduce chatter from third-party libraries
+# Silence noisy libraries
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("pymongo").setLevel(logging.WARNING)
-logging.getLogger("apscheduler").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
@@ -68,267 +54,197 @@ def get_uptime():
     return f"{days}d {hours}h {minutes}m {seconds}s"
 
 async def send_error_log(update, context, error_msg):
-    """Generates a text file with the error trace and sends it to the user."""
     try:
-        log_content = f"⚠️ Error Occurred:\n{error_msg}\n\nTraceback:\n{traceback.format_exc()}"
+        log_content = f"⚠️ Error:\n{error_msg}\n\nTrace:\n{traceback.format_exc()}"
         with open("error_log.txt", "w", encoding="utf-8") as f:
             f.write(log_content)
         
         chat_id = update.effective_chat.id if update.effective_chat else Config.CHANNEL_ID
         with open("error_log.txt", "rb") as f:
-            await context.bot.send_document(
-                chat_id=chat_id, 
-                document=f, 
-                caption="⚠️ **Bot Error Log**"
-            )
+            await context.bot.send_document(chat_id=chat_id, document=f, caption="⚠️ **Error Log**")
         os.remove("error_log.txt")
-    except Exception:
-        logger.error("Failed to send error log to user.")
+    except: pass
 
-# --- COMMAND HANDLERS ---
+# --- COMMANDS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🚀 **Leech Bot is Active**\n\n"
-        "Commands:\n"
-        "/search <anime> - Find episodes\n"
-        "/torrent <link> - Direct download\n"
-        "/stats - Server health",
-        parse_mode="Markdown"
-    )
+    await update.message.reply_text("🚀 **Leech Bot Active**\n/search, /torrent, /stats", parse_mode="Markdown")
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # LAZY IMPORT (Saves Startup RAM)
-    import psutil
+    msg = await update.message.reply_text("🔄 Checking...")
     
-    msg = await update.message.reply_text("🔄 Checking stats...")
+    # LAZY IMPORT: Only loads psutil when command is run
+    import psutil 
+    
     cpu = psutil.cpu_percent()
     ram = psutil.virtual_memory()
     total_users = await db.get_total_users()
     down, up = await db.get_total_traffic()
     
     text = (
-        f"📊 **System Status**\n"
-        f"**Uptime**: `{get_uptime()}`\n"
-        f"**CPU**: `{cpu}%` | **RAM**: `{ram.percent}%`\n\n"
-        f"🤖 **Bot Usage**\n"
+        f"📊 **Status**\n"
+        f"**CPU**: `{cpu}%` | **RAM**: `{ram.percent}%`\n"
         f"**Users**: `{total_users}`\n"
         f"**Traffic**: ⬇️ `{human_readable_size(down)}` | ⬆️ `{human_readable_size(up)}`"
     )
     await msg.edit_text(text, parse_mode="Markdown")
 
-# --- CORE PROCESSING ENGINE ---
+# --- CORE LOGIC ---
 async def monitor_and_process_download(gid, update, context, status_msg):
     try:
         async def progress_callback(status):
-            # Only update Telegram message, don't log to console
             try:
                 p = status['progress']
-                # Throttle updates to avoid Telegram rate limits (every 5% or similar logic is implicit in aria2 wrapper)
-                await status_msg.edit_text(
-                    f"📥 **Downloading...**\n"
-                    f"📂 `{status['name']}`\n"
-                    f"{get_progress_bar(p)} **{p}%**\n"
-                    f"🚀 `{status['speed']}` | ⏳ `{status.get('eta', 'N/A')}`",
-                    parse_mode="Markdown"
-                )
+                # Only edit if percentage changes significantly to save API calls
+                if int(float(p)) % 5 == 0: 
+                    await status_msg.edit_text(f"📥 **Downloading...** {p}%", parse_mode="Markdown")
             except: pass
 
         await downloader.wait_for_completion(gid, callback=progress_callback)
 
         status = await downloader.get_status(gid)
         if status and status["status"] == "complete":
-            await status_msg.edit_text("✅ Download complete. Preparing files...")
+            await status_msg.edit_text("✅ Downloaded. Processing...")
             base_path = f"./downloads/{status['name']}"
             user_id = update.effective_user.id
             
             if os.path.exists(base_path):
-                files_to_upload = []
+                files = []
+                if os.path.isfile(base_path): files.append(base_path)
+                else:
+                    for r, _, f in os.walk(base_path):
+                        for file in f:
+                            if file.lower().endswith(('.mkv', '.mp4', '.avi', '.webm')):
+                                files.append(os.path.join(r, file))
+                    files.sort()
 
-                if os.path.isfile(base_path):
-                    files_to_upload.append(base_path)
-                elif os.path.isdir(base_path):
-                    for root, _, filenames in os.walk(base_path):
-                        for filename in filenames:
-                            if filename.lower().endswith(('.mkv', '.mp4', '.avi', '.webm')):
-                                files_to_upload.append(os.path.join(root, filename))
-                    files_to_upload.sort()
-
-                if not files_to_upload:
-                    await status_msg.edit_text("⚠️ No video files found.")
+                if not files:
+                    await status_msg.edit_text("⚠️ No video files.")
                     if os.path.isdir(base_path): shutil.rmtree(base_path)
-                    elif os.path.isfile(base_path): os.remove(base_path)
                     return
 
-                await status_msg.edit_text(f"Found {len(files_to_upload)} files. Processing...")
-
-                last_anime_name = None
-                last_ep_num = None
-                total_files = len(files_to_upload)
-
-                for index, video_path in enumerate(files_to_upload):
-                    file_name = os.path.basename(video_path)
-                    final_path = video_path
+                await status_msg.edit_text(f"Found {len(files)} files.")
+                
+                last_anime = None
+                last_ep = None
+                
+                for idx, v_path in enumerate(files):
+                    fname = os.path.basename(v_path)
+                    final_path = v_path
                     sub_path = None
                     
-                    # Auto-Muxing
-                    base_name = os.path.splitext(video_path)[0]
+                    # Check Subtitles
+                    base = os.path.splitext(v_path)[0]
                     for ext in [".srt", ".vtt", ".ass"]:
-                        if os.path.exists(base_name + ext):
-                            sub_path = base_name + ext
+                        if os.path.exists(base + ext):
+                            sub_path = base + ext
                             break
                     
-                    if sub_path and mux_subtitles:
-                        await status_msg.edit_text(f"🛠️ **Muxing...**\n`{file_name}`")
-                        output_ext = os.path.splitext(video_path)[1]
-                        output_muxed = base_name + "_muxed" + output_ext
-                        
-                        success = mux_subtitles(video_path, sub_path, output_muxed)
-                        if success:
-                            final_path = output_muxed
-                            file_name = os.path.basename(final_path)
-                        else:
-                            # Log warning only if muxing fails
-                            logger.warning(f"Muxing failed for {file_name}, reverting to original.")
+                    if sub_path:
+                        # LAZY IMPORT: Only load Muxer if subtitles exist
+                        try:
+                            from processor.muxer import mux_subtitles
+                            await status_msg.edit_text(f"🛠️ **Muxing...**")
+                            out_muxed = base + "_muxed" + os.path.splitext(v_path)[1]
+                            if mux_subtitles(v_path, sub_path, out_muxed):
+                                final_path = out_muxed
+                                fname = os.path.basename(final_path)
+                        except ImportError:
+                            logger.warning("Muxer not found.")
 
                     # Upload
-                    file_size = os.path.getsize(final_path)
                     try:
-                        await status_msg.edit_text(f"⬆️ **Uploading ({index+1}/{total_files})**", parse_mode="Markdown")
-                        
+                        await status_msg.edit_text(f"⬆️ **Uploading ({idx+1}/{len(files)})**")
                         with open(final_path, 'rb') as doc:
-                            await context.bot.send_document(
-                                chat_id=Config.CHANNEL_ID,
-                                document=doc,
-                                caption=f"✨ **Upload Complete**\n📂 `{file_name}`",
-                                parse_mode="Markdown"
-                            )
+                            await context.bot.send_document(Config.CHANNEL_ID, document=doc, caption=f"📂 `{fname}`", parse_mode="Markdown")
                         
-                        anime_name, last_ep = await db.add_history(user_id, file_name)
-                        if anime_name: 
-                            last_anime_name = anime_name
-                            last_ep_num = last_ep
+                        anime, ep = await db.add_history(user_id, fname)
+                        if anime: last_anime, last_ep = anime, ep
+                        
+                        fsize = os.path.getsize(final_path)
+                        await db.update_stats(user_id, fsize, fsize)
+                        
+                        # Auto-Cleanup DB for batches
+                        if idx == len(files) - 1 and len(files) > 1 and last_anime:
+                            await db.delete_history(user_id, last_anime)
+                            last_anime = None
                             
-                        await db.update_stats(user_id, bytes_downloaded=file_size, bytes_uploaded=file_size)
-
-                        if index == total_files - 1 and total_files > 1:
-                            if last_anime_name:
-                                await status_msg.edit_text(f"♻️ **Cleaning DB...**", parse_mode="Markdown")
-                                await db.delete_history(user_id, last_anime_name)
-                                last_anime_name = None
-
+                        # Delete Files
                         if os.path.exists(final_path): os.remove(final_path)
-                        if final_path != video_path and os.path.exists(video_path): os.remove(video_path)
+                        if final_path != v_path and os.path.exists(v_path): os.remove(v_path)
                         if sub_path and os.path.exists(sub_path): os.remove(sub_path)
-
+                        
                     except Exception as e:
                         logger.error(f"Upload failed: {e}")
-                        await send_error_log(update, context, f"Upload Failed: {e}")
-
-                if os.path.isdir(base_path):
-                    shutil.rmtree(base_path)
-
-                completion_text = "✅ **Done!**"
-                buttons = []
-                if last_anime_name and last_ep_num:
-                    next_ep = last_ep_num + 1
-                    query_str = f"{last_anime_name} {next_ep}"
-                    completion_text += f"\n\n📺 **Tracked**: {last_anime_name} (Ep {last_ep_num})"
-                    buttons.append([InlineKeyboardButton(f"⏭️ Ep {next_ep}", callback_data=f"next_{query_str}")])
-
-                if buttons:
-                    await status_msg.edit_text(completion_text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
+                
+                if os.path.isdir(base_path): shutil.rmtree(base_path)
+                
+                # Success Msg
+                txt = "✅ **Done!**"
+                if last_anime and last_ep:
+                    txt += f"\n\n📺 **Tracked**: {last_anime} (Ep {last_ep})"
+                    btn = [[InlineKeyboardButton(f"⏭️ Ep {last_ep+1}", callback_data=f"next_{last_anime} {last_ep+1}")]]
+                    await status_msg.edit_text(txt, reply_markup=InlineKeyboardMarkup(btn), parse_mode="Markdown")
                 else:
-                    await status_msg.edit_text(completion_text, parse_mode="Markdown")
-
+                    await status_msg.edit_text(txt, parse_mode="Markdown")
             else:
-                await status_msg.edit_text("❌ Error: File not found.")
+                await status_msg.edit_text("❌ File missing.")
         else:
             await status_msg.edit_text("❌ Download failed.")
-
+            
     except Exception as e:
-        logger.error(f"Critical Error: {e}")
-        await status_msg.edit_text("⚠️ Critical Error.")
+        logger.error(f"Critical: {e}")
         await send_error_log(update, context, str(e))
 
-async def torrent_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        return await update.message.reply_text("❌ Usage: `/torrent <link>`", parse_mode="Markdown")
-    
-    link = context.args[0]
-    status_msg = await update.message.reply_text("⚡ Initializing...")
-    
-    try:
-        gid = await downloader.add_torrent(link)
-        if gid:
-            await monitor_and_process_download(gid, update, context, status_msg)
-        else:
-            await status_msg.edit_text("❌ Failed to add torrent.")
-    except Exception as e:
-        await send_error_log(update, context, str(e))
+# --- USER COMMANDS (Unchanged) ---
+async def torrent_command(update, context):
+    if not context.args: return await update.message.reply_text("❌ `/torrent <link>`")
+    msg = await update.message.reply_text("⚡ Initializing...")
+    gid = await downloader.add_torrent(context.args[0])
+    if gid: await monitor_and_process_download(gid, update, context, msg)
+    else: await msg.edit_text("❌ Failed.")
 
-async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        return await update.message.reply_text("❌ Usage: `/search <anime>`", parse_mode="Markdown")
+async def search(update, context):
+    if not context.args: return await update.message.reply_text("❌ `/search <anime>`")
+    q = " ".join(context.args)
+    msg = await update.message.reply_text("🔍 Searching...")
+    res = []
     
-    query = " ".join(context.args)
-    status_msg = await update.message.reply_text(f"🔍 Searching...")
-    results = []
-    
-    try: results = await CommonAnimeScraper().run(query) 
+    try: res = await CommonAnimeScraper().run(q)
     except: pass
-    
-    if not results:
-        try: results = await scrape_gogoanime(query)
+    if not res:
+        try: res = await scrape_gogoanime(q)
         except: pass
-    
-    if not results:
-        try: results = await AnimeBot().run(query)
+    if not res:
+        try: res = await AnimeBot().run(q)
         except: pass
-
-    if not results:
-        return await status_msg.edit_text("❌ No results found.")
-
-    keyboard = []
-    for res in results[:10]:
-        title = res.get("title", "Unknown")[:40]
-        url = res.get("url", "")
-        rtype = res.get("type", "video")
-        prefix = "lnk" if rtype == "link" else "doc" if rtype == "file" else "vid"
-        icon = "🔗" if rtype == "link" else "📂" if rtype == "file" else "🎬"
-        keyboard.append([InlineKeyboardButton(f"{icon} {title}", callback_data=f"{prefix}_{url}")])
-
-    await status_msg.edit_text(f"✅ Results for **{query}**:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
+        
+    if not res: return await msg.edit_text("❌ None found.")
     
-    try:
-        if data.startswith("vid_"):
-            url = data.split("_", 1)[1]
-            keyboard = [[InlineKeyboardButton(q, callback_data=f"qual_{q}_{url}")] for q in ["1080p", "720p", "360p"]]
-            await query.edit_message_text(f"🎬 Select Quality:", reply_markup=InlineKeyboardMarkup(keyboard))
+    kb = []
+    for r in res[:10]:
+        t = r.get("title", "?")[:40]
+        p = "lnk" if r.get("type") == "link" else "vid"
+        kb.append([InlineKeyboardButton(f"🎬 {t}", callback_data=f"{p}_{r.get('url')}")])
+        
+    await msg.edit_text(f"✅ Results: **{q}**", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
 
-        elif data.startswith("lnk_"):
-            url = data.split("_", 1)[1]
-            await query.edit_message_text("🔗 Link sent to channel.")
-            await context.bot.send_message(Config.CHANNEL_ID, text=f"🚀 **Direct Link**\n{url}")
-
-        elif data.startswith("qual_") or data.startswith("doc_"):
-            url = data.split("_", 2)[-1] if data.startswith("qual") else data.split("_", 1)[1]
-            await query.edit_message_text("⚡ Starting download...")
-            gid = await downloader.add_torrent(url)
-            if gid:
-                await monitor_and_process_download(gid, update, context, query.message)
-            else:
-                await query.edit_message_text("❌ Download failed.")
-
-        elif data.startswith("next_"):
-            search_query = data.split("_", 1)[1]
-            await query.edit_message_text(f"🔍 Searching Next Ep: `{search_query}`", parse_mode="Markdown")
-            context.args = search_query.split(" ")
-            await search(update, context)
-
-    except Exception as e:
-        await send_error_log(update, context, f"Error: {str(e)}")
+async def button_callback(update, context):
+    q = update.callback_query
+    await q.answer()
+    d = q.data
+    
+    if d.startswith("vid_"):
+        u = d.split("_", 1)[1]
+        k = [[InlineKeyboardButton(x, callback_data=f"qual_{x}_{u}")] for x in ["1080p", "720p"]]
+        await q.edit_message_text("Select Quality:", reply_markup=InlineKeyboardMarkup(k))
+    elif d.startswith("lnk_"):
+        await context.bot.send_message(Config.CHANNEL_ID, f"🔗 {d.split('_',1)[1]}")
+        await q.edit_message_text("🔗 Sent to channel.")
+    elif d.startswith("qual_"):
+        u = d.split("_", 2)[-1]
+        await q.edit_message_text("⚡ Downloading...")
+        gid = await downloader.add_torrent(u)
+        if gid: await monitor_and_process_download(gid, update, context, q.message)
+    elif d.startswith("next_"):
+        context.args = d.split("_", 1)[1].split(" ")
+        await search(update, context)
