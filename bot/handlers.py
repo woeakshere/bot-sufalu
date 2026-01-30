@@ -3,7 +3,7 @@ import shutil
 import logging
 import time
 import traceback
-import signal
+import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
@@ -24,7 +24,6 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[logging.StreamHandler()]
 )
-# Silence noisy libraries
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("pymongo").setLevel(logging.WARNING)
 
@@ -72,15 +71,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🚀 **Leech Bot Active**\n\n"
         "/search <name> - Find anime\n"
         "/torrent <link> - Direct download\n"
-        "/setthumb - Reply to photo to set custom thumbnail\n"
-        "/stats - Bot health", 
+        "/setthumb - Set custom thumbnail\n"
+        "/stats - Server health", 
         parse_mode="Markdown"
     )
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("🔄 Checking...")
-    
-    # LAZY IMPORT: Only loads psutil when command is run
     import psutil 
     
     cpu = psutil.cpu_percent()
@@ -97,29 +94,59 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.edit_text(text, parse_mode="Markdown")
 
 async def set_thumb_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Sets a custom thumbnail for the user."""
     if not update.message.reply_to_message or not update.message.reply_to_message.photo:
         return await update.message.reply_text("❌ Reply to a photo to set it as thumbnail.")
     
-    msg = await update.message.reply_text("⬇️ Downloading photo...")
-    
-    # Download photo to memory (not disk)
+    msg = await update.message.reply_text("⬇️ Downloading...")
     photo = await update.message.reply_to_message.photo[-1].get_file()
     photo_bytes = await photo.download_as_bytearray()
     
-    # Save to DB
     await db.set_thumbnail(update.effective_user.id, photo_bytes)
-    await msg.edit_text("✅ **Thumbnail Saved!**\nIt will appear on your next upload.", parse_mode="Markdown")
+    await msg.edit_text("✅ **Thumbnail Saved!**", parse_mode="Markdown")
+
+# --- ADMIN COMMANDS ---
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    # 1. MULTI-ADMIN CHECK
+    if user_id not in Config.ADMIN_IDS:
+        return # Silent ignore for non-admins
+
+    if not context.args:
+        return await update.message.reply_text("❌ Usage: `/broadcast <message>`")
+
+    msg = " ".join(context.args)
+    status_msg = await update.message.reply_text("📢 **Broadcasting...**", parse_mode="Markdown")
+    
+    cursor = db.users.find({})
+    total, success, blocked = 0, 0, 0
+
+    async for user in cursor:
+        total += 1
+        try:
+            await context.bot.send_message(chat_id=user['user_id'], text=f"📢 **Announcement:**\n\n{msg}", parse_mode="Markdown")
+            success += 1
+            await asyncio.sleep(0.05) 
+        except Exception:
+            blocked += 1
+    
+    await status_msg.edit_text(f"✅ **Done**\nTotal: `{total}`\nSent: `{success}`\nBlocked: `{blocked}`", parse_mode="Markdown")
 
 # --- CORE LOGIC ---
 async def monitor_and_process_download(gid, update, context, status_msg):
     try:
+        # 2. CREATE CANCEL BUTTON
+        cancel_btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Task", callback_data=f"cancel_{gid}")]])
+
         async def progress_callback(status):
             try:
                 p = status['progress']
-                # Only edit if percentage changes significantly to save API calls
                 if int(float(p)) % 5 == 0: 
-                    await status_msg.edit_text(f"📥 **Downloading...** {p}%", parse_mode="Markdown")
+                    await status_msg.edit_text(
+                        f"📥 **Downloading...** {p}%\n"
+                        f"🚀 `{status['speed']}` | ⏳ `{status.get('eta', 'N/A')}`",
+                        reply_markup=cancel_btn, # <--- Attach button here
+                        parse_mode="Markdown"
+                    )
             except: pass
 
         await downloader.wait_for_completion(gid, callback=progress_callback)
@@ -146,19 +173,14 @@ async def monitor_and_process_download(gid, update, context, status_msg):
                     return
 
                 await status_msg.edit_text(f"Found {len(files)} files.")
-                
-                last_anime = None
-                last_ep = None
-                
-                # Pre-fetch thumbnail once to save DB calls in loop
                 thumb_data = await db.get_thumbnail(user_id)
+                last_anime, last_ep = None, None
 
                 for idx, v_path in enumerate(files):
                     fname = os.path.basename(v_path)
                     final_path = v_path
                     sub_path = None
                     
-                    # Check Subtitles
                     base = os.path.splitext(v_path)[0]
                     for ext in [".srt", ".vtt", ".ass"]:
                         if os.path.exists(base + ext):
@@ -166,7 +188,6 @@ async def monitor_and_process_download(gid, update, context, status_msg):
                             break
                     
                     if sub_path:
-                        # LAZY IMPORT: Only load Muxer if subtitles exist
                         try:
                             from processor.muxer import mux_subtitles
                             await status_msg.edit_text(f"🛠️ **Muxing...**")
@@ -174,45 +195,36 @@ async def monitor_and_process_download(gid, update, context, status_msg):
                             if mux_subtitles(v_path, sub_path, out_muxed):
                                 final_path = out_muxed
                                 fname = os.path.basename(final_path)
-                        except ImportError:
-                            logger.warning("Muxer not found.")
+                        except ImportError: pass
 
-                    # Upload
                     try:
                         await status_msg.edit_text(f"⬆️ **Uploading ({idx+1}/{len(files)})**")
-                        
                         with open(final_path, 'rb') as doc:
-                            # ATTACH THUMBNAIL HERE
                             await context.bot.send_document(
                                 Config.CHANNEL_ID, 
                                 document=doc, 
                                 caption=f"📂 `{fname}`", 
-                                thumbnail=thumb_data, # <--- Used here
+                                thumbnail=thumb_data,
                                 parse_mode="Markdown"
                             )
                         
                         anime, ep = await db.add_history(user_id, fname)
                         if anime: last_anime, last_ep = anime, ep
-                        
                         fsize = os.path.getsize(final_path)
                         await db.update_stats(user_id, fsize, fsize)
                         
-                        # Auto-Cleanup DB for batches
                         if idx == len(files) - 1 and len(files) > 1 and last_anime:
                             await db.delete_history(user_id, last_anime)
                             last_anime = None
                             
-                        # Delete Files
                         if os.path.exists(final_path): os.remove(final_path)
                         if final_path != v_path and os.path.exists(v_path): os.remove(v_path)
                         if sub_path and os.path.exists(sub_path): os.remove(sub_path)
-                        
                     except Exception as e:
                         logger.error(f"Upload failed: {e}")
                 
                 if os.path.isdir(base_path): shutil.rmtree(base_path)
                 
-                # Success Msg
                 txt = "✅ **Done!**"
                 if last_anime and last_ep:
                     txt += f"\n\n📺 **Tracked**: {last_anime} (Ep {last_ep})"
@@ -222,6 +234,9 @@ async def monitor_and_process_download(gid, update, context, status_msg):
                     await status_msg.edit_text(txt, parse_mode="Markdown")
             else:
                 await status_msg.edit_text("❌ File missing.")
+        # 3. HANDLE CANCELLED STATE
+        elif status and status["status"] == "removed":
+            await status_msg.edit_text("❌ **Task Cancelled.**", parse_mode="Markdown")
         else:
             await status_msg.edit_text("❌ Download failed.")
             
@@ -229,7 +244,6 @@ async def monitor_and_process_download(gid, update, context, status_msg):
         logger.error(f"Critical: {e}")
         await send_error_log(update, context, str(e))
 
-# --- USER COMMANDS (Unchanged) ---
 async def torrent_command(update, context):
     if not context.args: return await update.message.reply_text("❌ `/torrent <link>`")
     msg = await update.message.reply_text("⚡ Initializing...")
@@ -271,14 +285,26 @@ async def button_callback(update, context):
         u = d.split("_", 1)[1]
         k = [[InlineKeyboardButton(x, callback_data=f"qual_{x}_{u}")] for x in ["1080p", "720p"]]
         await q.edit_message_text("Select Quality:", reply_markup=InlineKeyboardMarkup(k))
+    
     elif d.startswith("lnk_"):
         await context.bot.send_message(Config.CHANNEL_ID, f"🔗 {d.split('_',1)[1]}")
         await q.edit_message_text("🔗 Sent to channel.")
+    
     elif d.startswith("qual_"):
         u = d.split("_", 2)[-1]
         await q.edit_message_text("⚡ Downloading...")
         gid = await downloader.add_torrent(u)
         if gid: await monitor_and_process_download(gid, update, context, q.message)
+    
     elif d.startswith("next_"):
         context.args = d.split("_", 1)[1].split(" ")
         await search(update, context)
+    
+    # 4. CANCEL LOGIC
+    elif d.startswith("cancel_"):
+        gid = d.split("_", 1)[1]
+        try:
+            await downloader.remove_download(gid)
+            await q.edit_message_text("🛑 **Stopping...**", parse_mode="Markdown")
+        except Exception as e:
+            await q.edit_message_text(f"❌ Failed to stop: {e}")
