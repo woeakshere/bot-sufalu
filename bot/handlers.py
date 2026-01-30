@@ -11,7 +11,8 @@ from telegram.ext import ContextTypes
 from scrapers.common_scraper import CommonAnimeScraper
 from scrapers.gogoanime3 import scrape_gogoanime
 from scrapers.animixplay import scrape_animixplay
-from scrapers.intelligent_scraper import IntelligentScraper
+# Fixed Import: IntelligentScraper is inside allanime.py
+from scrapers.allanime import IntelligentScraper 
 
 # --- CORE IMPORTS ---
 from downloader.torrent import TorrentDownloader
@@ -44,6 +45,7 @@ def human_readable_size(size, decimal_places=2):
     return f"{size:.{decimal_places}f} PB"
 
 async def async_delete(path):
+    """Non-blocking delete to avoid freezing bot"""
     if not path or not os.path.exists(path): return
     try:
         if os.path.isfile(path):
@@ -73,8 +75,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    import psutil
     msg = await update.message.reply_text("🔄 Checking...")
+    import psutil
     cpu = psutil.cpu_percent()
     ram = psutil.virtual_memory()
     total_users = await db.get_total_users()
@@ -125,6 +127,7 @@ async def monitor_and_process_download(gid, update, context, status_msg):
 
         async def progress_callback(status):
             try:
+                # Update progress sparingly to avoid ratelimit
                 if int(float(status['progress'])) % 5 == 0:
                     await status_msg.edit_text(
                         f"📥 **{status['progress']}%** | 🚀 `{status['speed']}`",
@@ -136,7 +139,7 @@ async def monitor_and_process_download(gid, update, context, status_msg):
         status = await downloader.get_status(gid)
 
         if status and status["status"] == "complete":
-            await status_msg.edit_text("✅ Processing...")
+            await status_msg.edit_text("✅ Processing Files...")
             base_path = f"./downloads/{status['name']}"
             created_files.append(base_path)
 
@@ -151,7 +154,7 @@ async def monitor_and_process_download(gid, update, context, status_msg):
             video_files.sort()
 
             if not video_files:
-                return await status_msg.edit_text("⚠️ No video files.")
+                return await status_msg.edit_text("⚠️ No video files found.")
 
             await status_msg.edit_text(f"Found {len(video_files)} files.")
             thumb_data = await db.get_thumbnail(update.effective_user.id)
@@ -218,12 +221,13 @@ async def monitor_and_process_download(gid, update, context, status_msg):
         elif status and status["status"] == "removed":
             await status_msg.edit_text("❌ **Cancelled.**", parse_mode="Markdown")
         else:
-            await status_msg.edit_text("❌ Failed.")
+            await status_msg.edit_text("❌ Download Failed.")
 
     except Exception as e:
         await send_error_log(update, context, str(e))
 
     finally:
+        # Non-blocking cleanup
         if base_path: await async_delete(base_path)
         for f in created_files: await async_delete(f)
 
@@ -242,7 +246,7 @@ async def search(update, context):
     msg = await update.message.reply_text("🔍 Searching...")
     res = []
 
-    # Try normal scrapers first (lightweight)
+    # 1. Try Normal Scrapers (Fast)
     scrapers = [
         ("Common", CommonAnimeScraper().run(q)),
         ("Gogo", scrape_gogoanime(q)),
@@ -250,22 +254,21 @@ async def search(update, context):
     ]
 
     for name, task in scrapers:
+        if res: break
         try:
-            res = await asyncio.wait_for(task, timeout=8)
+            res = await asyncio.wait_for(task, timeout=10)
             if res:
-                logger.info(f"Scraper '{name}' succeeded with {len(res)} results.")
-                break
-        except Exception as e:
-            logger.warning(f"Scraper '{name}' failed or timed out: {e}")
+                logger.info(f"Scraper '{name}' succeeded.")
+        except Exception:
+            pass
 
-    # Fallback to AllAnime (heavy, automation)
+    # 2. Fallback to AllAnime (Intelligent/Slow)
     if not res:
         try:
             intelligent = IntelligentScraper()
             res = await intelligent.search(q, top_n=10)
         except Exception as e:
-            await msg.edit_text(f"❌ Search failed: {e}")
-            return
+            logger.error(f"AllAnime Search Failed: {e}")
 
     if not res:
         return await msg.edit_text("❌ None found.")
@@ -276,7 +279,7 @@ async def search(update, context):
         kb.append([InlineKeyboardButton(f"🎬 {t}", callback_data=f"vid_{r.get('url')}")])
     await msg.edit_text(f"✅ Results: **{q}**", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
 
-# --- BUTTON CALLBACK ---
+# --- BUTTON CALLBACKS ---
 QUALITY_OPTIONS = ["1080p sub", "1080p dub", "720p sub", "720p dub"]
 
 async def button_callback(update, context):
@@ -284,95 +287,115 @@ async def button_callback(update, context):
     await q.answer()
     d = q.data
 
+    # --- STEP 1: Fetch Episodes for Selected Anime ---
     if d.startswith("vid_"):
         anime_url = d.split("_", 1)[1]
-
-        # Try normal scrapers first
         episodes = []
-        normal_failed = False
+        
+        # Try finding episodes
         try:
-            if any(domain in anime_url for domain in ["9animetv.to","anigo.to","hianime.to","aniwatchtv.to"]):
+            if "gogoanime3" in anime_url:
+                from scrapers.gogoanime3 import get_gogoanime_episodes
+                episodes = await get_gogoanime_episodes(anime_url)
+            elif "animixplay" in anime_url:
+                from scrapers.animixplay import get_animixplay_episodes
+                episodes = await get_animixplay_episodes(anime_url)
+            else:
+                # Default/Common
                 scraper = CommonAnimeScraper()
                 episodes = await scraper.get_episodes(anime_url)
-            elif "gogoanime3.cv" in anime_url:
-                episodes = await scrape_gogoanime(anime_url)
-            elif "animixplay.by" in anime_url:
-                episodes = await scrape_animixplay(anime_url)
-            else:
-                normal_failed = True
         except Exception as e:
-            logger.warning(f"Normal scraper failed: {e}")
-            normal_failed = True
+            logger.error(f"Episode fetch error: {e}")
 
-        # Fallback to AllAnime automation
-        if normal_failed or not episodes:
-            try:
-                await q.edit_message_text("⚡ Resolving link via AllAnime automation...")
-                intelligent = IntelligentScraper()
-                resolved_url = await intelligent.resolve_download(anime_url)
-                if resolved_url:
-                    await q.edit_message_text(f"✅ Direct link:\n{resolved_url}")
-                else:
-                    await q.edit_message_text("❌ Could not resolve a direct link.")
-                return
-            except Exception as e:
-                await q.edit_message_text(f"❌ AllAnime automation failed: {e}")
-                return
+        # If normal fetch fails, we can't do much here for batching, 
+        # unless we want to try AllAnime resolution immediately, 
+        # but AllAnime resolution is per-episode.
+        if not episodes:
+             await q.edit_message_text("❌ Could not fetch episode list. Try another source.")
+             return
 
-        # Normal scraper flow: user selects quality
+        # Store episodes for next step
         context.user_data["pending_episodes"] = episodes
-        context.user_data["quality_selected_event"] = asyncio.Event()
-
+        
+        # Ask for Quality
         kb = [[InlineKeyboardButton(opt, callback_data=f"qual_{opt.replace(' ','_')}")] for opt in QUALITY_OPTIONS]
         await q.edit_message_text(
-            "🎚 Select quality / sub or wait 5s for default (1080p sub):",
-            reply_markup=InlineKeyboardMarkup(kb)
+            f"🎬 Found **{len(episodes)}** episodes.\nSelect Quality / Language:",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode="Markdown"
         )
 
-        try:
-            await asyncio.wait_for(context.user_data["quality_selected_event"].wait(), timeout=5)
-        except asyncio.TimeoutError:
-            context.user_data["selected_quality"] = "1080p sub"
-            context.user_data["quality_selected_event"].set()
-
+    # --- STEP 2: Process Batch Download ---
     elif d.startswith("qual_"):
         selected_quality = d.split("_", 1)[1].replace("_"," ")
-        context.user_data["selected_quality"] = selected_quality
-        if "quality_selected_event" in context.user_data:
-            context.user_data["quality_selected_event"].set()
-
         episodes = context.user_data.get("pending_episodes", [])
-        quality = context.user_data.get("selected_quality", "1080p sub")
-        await q.edit_message_text(f"⚡ Downloading all episodes ({quality})...")
+        
+        if not episodes:
+            await q.edit_message_text("❌ Session expired. Search again.")
+            return
 
-        for ep in episodes:
+        status_msg = q.message
+        total_eps = len(episodes)
+        
+        await status_msg.edit_text(f"⚡ Queueing **{total_eps}** episodes ({selected_quality})...")
+        
+        # Loop through episodes sequentially
+        for index, ep in enumerate(episodes, 1):
+            ep_url = ep["url"]
+            ep_title = ep["title"]
+            
+            # Modify URL for sub/dub if possible (naive attempt)
+            # Note: This usually requires specific scraper support, 
+            # but we pass it anyway in case the resolver uses it.
+            if "sub" in selected_quality: ep_url += "?sub=1"
+            elif "dub" in selected_quality: ep_url += "?dub=1"
+
             try:
-                url = ep["url"]
-                if "sub" in quality.lower():
-                    url += "?sub=1"
-                elif "dub" in quality.lower():
-                    url += "?dub=1"
+                await status_msg.edit_text(
+                    f"⏳ **Processing {index}/{total_eps}**\n"
+                    f"📺 `{ep_title}`\n"
+                    f"⚙️ Attempting Standard Download..."
+                )
+                
+                # 1. Try Standard Download
+                gid = await downloader.add_torrent(ep_url)
+                
+                # 2. Fallback: Automated Intelligent Scraper
+                if not gid:
+                    await status_msg.edit_text(f"⚙️ Standard failed. Creating automation task...")
+                    try:
+                        scraper = IntelligentScraper()
+                        # resolve_download returns a direct link
+                        direct_link = await scraper.resolve_download(ep_url)
+                        if direct_link:
+                            gid = await downloader.add_torrent(direct_link)
+                    except Exception as e:
+                        logger.error(f"Automation failed for {ep_title}: {e}")
 
-                gid = await downloader.add_torrent(url)
+                # 3. Monitor & Upload (Blocking Wait)
                 if gid:
-                    await monitor_and_process_download(gid, update, context, q.message)
+                    # Pass status_msg so it updates progress inside this function
+                    await monitor_and_process_download(gid, update, context, status_msg)
+                else:
+                    await status_msg.edit_text(f"❌ Skipped: {ep_title} (No link found)")
+                    await asyncio.sleep(2)
+
             except Exception as e:
-                logger.warning(f"Failed to queue episode {ep['title']}: {e}")
+                logger.error(f"Batch Loop Error on {ep_title}: {e}")
+                await asyncio.sleep(1)
 
+        await status_msg.edit_text("✅ **All Episodes Processed.**")
+        
+        # Cleanup Context
         context.user_data["pending_episodes"] = []
-        context.user_data["selected_quality"] = None
-        context.user_data.pop("quality_selected_event", None)
 
+    # --- CANCEL TASK ---
     elif d.startswith("cancel_"):
         gid = d.split("_", 1)[1]
         try:
             await downloader.remove_download(gid)
             await async_delete(f"./downloads/{gid}")
             await q.edit_message_text("🛑 **Stopped and cleaned.**", parse_mode="Markdown")
-
-            context.user_data["pending_episodes"] = []
-            context.user_data["selected_quality"] = None
-            context.user_data.pop("quality_selected_event", None)
         except Exception as e:
             await q.edit_message_text(f"❌ Failed: {e}", parse_mode="Markdown")
 
