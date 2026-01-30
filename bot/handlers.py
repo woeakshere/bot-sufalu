@@ -11,7 +11,6 @@ from telegram.ext import ContextTypes
 from scrapers.common_scraper import CommonAnimeScraper
 from scrapers.gogoanime3 import scrape_gogoanime
 from scrapers.animixplay import scrape_animixplay
-# ✅ FIX: Import from 'allanime' (the actual filename), not 'intelligent_scraper'
 from scrapers.allanime import IntelligentScraper 
 
 # --- CORE IMPORTS ---
@@ -45,7 +44,7 @@ def human_readable_size(size, decimal_places=2):
     return f"{size:.{decimal_places}f} PB"
 
 async def async_delete(path):
-    """Non-blocking delete to avoid freezing bot during cleanup."""
+    """Non-blocking delete to avoid freezing bot"""
     if not path or not os.path.exists(path): return
     try:
         if os.path.isfile(path):
@@ -395,5 +394,4 @@ async def button_callback(update, context):
         except Exception as e:
             await q.edit_message_text(f"❌ Failed: {e}", parse_mode="Markdown")
 
-# --- START MEMORY MANAGER ---
-asyncio.get_event_loop().create_task(start_memory_manager())
+# ERROR WAS HERE: Removed global asyncio.create_task(start_memory_manager())
