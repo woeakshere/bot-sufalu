@@ -1,12 +1,22 @@
+# --- Core Frameworks ---
 python-telegram-bot==21.9
-motor==3.6.0
-playwright==1.49.1
-ffmpeg-python==0.2.0
 fastapi==0.115.6
 uvicorn==0.34.0
 python-dotenv==1.0.1
-aria2p==0.12.0
+
+# --- Database & Performance ---
+motor==3.6.0
+psutil==6.1.1
+# Added for async MongoDB performance
+dnspython==2.7.0
+
+# --- Scraping & Extraction ---
+playwright==1.49.1
 beautifulsoup4==4.12.3
-psutil
-# Telethon removed (Not used, saves RAM)
-# Requests removed (PTB uses httpx internally, saves RAM)
+# Added for scrapers using playwright
+httpx==0.28.1
+
+# --- Downloader & Media ---
+aria2p==0.12.0
+# Note: Use 'static-ffmpeg' if you can't install ffmpeg via Docker, 
+# but your current Dockerfile handles the system binary correctly.
