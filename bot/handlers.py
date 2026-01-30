@@ -4,7 +4,6 @@ import logging
 import time
 import traceback
 import asyncio
-import sys
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, error as tg_error
 from telegram.ext import ContextTypes
 
@@ -45,7 +44,6 @@ def human_readable_size(size, decimal_places=2):
     return f"{size:.{decimal_places}f} PB"
 
 async def async_delete(path):
-    """Non-blocking delete to avoid freezing bot"""
     if not path or not os.path.exists(path): return
     try:
         if os.path.isfile(path):
@@ -226,10 +224,10 @@ async def monitor_and_process_download(gid, update, context, status_msg):
         await send_error_log(update, context, str(e))
 
     finally:
-        # Non-blocking cleanup
         if base_path: await async_delete(base_path)
         for f in created_files: await async_delete(f)
 
+# --- TORRENT COMMAND ---
 async def torrent_command(update, context):
     if not context.args: return await update.message.reply_text("❌ `/torrent <link>`")
     msg = await update.message.reply_text("⚡ Initializing...")
@@ -237,6 +235,7 @@ async def torrent_command(update, context):
     if gid: await monitor_and_process_download(gid, update, context, msg)
     else: await msg.edit_text("❌ Failed.")
 
+# --- SEARCH COMMAND ---
 async def search(update, context):
     if not context.args: return await update.message.reply_text("❌ `/search <anime>`")
     q = " ".join(context.args)
@@ -268,26 +267,92 @@ async def search(update, context):
         kb.append([InlineKeyboardButton(f"🎬 {t}", callback_data=f"vid_{r.get('url')}")])
     await msg.edit_text(f"✅ Results: **{q}**", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
 
+# --- BUTTON CALLBACK ---
+QUALITY_OPTIONS = ["1080p sub", "1080p dub", "720p sub", "720p dub"]
+
 async def button_callback(update, context):
     q = update.callback_query
     await q.answer()
     d = q.data
 
     if d.startswith("vid_"):
-        u = d.split("_", 1)[1]
-        k = [[InlineKeyboardButton(x, callback_data=f"qual_{x}_{u}")] for x in ["1080p", "720p"]]
-        await q.edit_message_text("Select Quality:", reply_markup=InlineKeyboardMarkup(k))
+        anime_url = d.split("_", 1)[1]
+
+        # Fetch episodes
+        episodes = []
+        try:
+            if any(domain in anime_url for domain in ["9animetv.to","anigo.to","hianime.to","aniwatchtv.to"]):
+                scraper = CommonAnimeScraper()
+                episodes = await scraper.get_episodes(anime_url)
+            elif "gogoanime3.cv" in anime_url:
+                episodes = await scrape_gogoanime(anime_url)
+            elif "animixplay.by" in anime_url:
+                episodes = await scrape_animixplay(anime_url)
+            else:
+                episodes = [{"title": "Download", "url": anime_url, "type": "link"}]
+
+        except Exception as e:
+            await q.edit_message_text(f"❌ Failed fetching episodes: {e}", parse_mode="Markdown")
+            return
+
+        if not episodes:
+            await q.edit_message_text("⚠️ No episodes found.", parse_mode="Markdown")
+            return
+
+        context.user_data["pending_episodes"] = episodes
+        context.user_data["quality_selected_event"] = asyncio.Event()
+
+        kb = [[InlineKeyboardButton(opt, callback_data=f"qual_{opt.replace(' ','_')}")] for opt in QUALITY_OPTIONS]
+        await q.edit_message_text("🎚 Select quality / sub or wait 5s for default (1080p sub):",
+                                  reply_markup=InlineKeyboardMarkup(kb))
+
+        try:
+            await asyncio.wait_for(context.user_data["quality_selected_event"].wait(), timeout=5)
+        except asyncio.TimeoutError:
+            context.user_data["selected_quality"] = "1080p sub"
+            context.user_data["quality_selected_event"].set()
+
     elif d.startswith("qual_"):
-        u = d.split("_", 2)[-1]
-        await q.edit_message_text("⚡ Downloading...")
-        gid = await downloader.add_torrent(u)
-        if gid: await monitor_and_process_download(gid, update, context, q.message)
+        selected_quality = d.split("_", 1)[1].replace("_"," ")
+        context.user_data["selected_quality"] = selected_quality
+        if "quality_selected_event" in context.user_data:
+            context.user_data["quality_selected_event"].set()
+
+        # Queue all episodes
+        episodes = context.user_data.get("pending_episodes", [])
+        quality = context.user_data.get("selected_quality", "1080p sub")
+        await q.edit_message_text(f"⚡ Downloading all episodes ({quality})...")
+
+        for ep in episodes:
+            try:
+                url = ep["url"]
+                if "sub" in quality.lower():
+                    url += "?sub=1"
+                elif "dub" in quality.lower():
+                    url += "?dub=1"
+
+                gid = await downloader.add_torrent(url)
+                if gid:
+                    await monitor_and_process_download(gid, update, context, q.message)
+            except Exception as e:
+                logger.warning(f"Failed to queue episode {ep['title']}: {e}")
+
+        # Cleanup
+        context.user_data["pending_episodes"] = []
+        context.user_data["selected_quality"] = None
+        context.user_data.pop("quality_selected_event", None)
+
     elif d.startswith("cancel_"):
         gid = d.split("_", 1)[1]
         try:
             await downloader.remove_download(gid)
             await async_delete(f"./downloads/{gid}")
             await q.edit_message_text("🛑 **Stopped and cleaned.**", parse_mode="Markdown")
+
+            context.user_data["pending_episodes"] = []
+            context.user_data["selected_quality"] = None
+            context.user_data.pop("quality_selected_event", None)
+
         except Exception as e:
             await q.edit_message_text(f"❌ Failed: {e}", parse_mode="Markdown")
 
