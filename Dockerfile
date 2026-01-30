@@ -16,6 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     unzip \
     gcc \
     python3-dev \
+    procps \
     libnss3 \
     libnspr4 \
     libatk1.0-0 \
@@ -39,20 +40,27 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Chromium Browser only (We already installed deps above)
+# Install Chromium Browser only
 RUN playwright install chromium
 
 # Copy application code
 COPY . .
 
-# Create downloads directory
-RUN mkdir -p /app/downloads
+# --- CLEANUP STEP 1: BUILD TIME ---
+# This removes any junk (downloads, cache, git history) that you might have
+# accidentally uploaded from your PC. It ensures the image is 100% fresh.
+RUN rm -rf /app/downloads /app/__pycache__ /app/.git /app/.github && \
+    mkdir -p /app/downloads
 
 # Expose the port
 EXPOSE 8000
 
-# Start command with Speed Optimizations & Trackers
-CMD aria2c \
+# --- CLEANUP STEP 2: STARTUP TIME ---
+# 1. 'pkill': Kills any "Zombie" Aria2 processes from previous crashes.
+# 2. 'rm -rf': Clears old downloads to free up space before starting.
+CMD pkill -f aria2c || true && \
+    rm -rf /app/downloads/* && \
+    aria2c \
     --enable-rpc \
     --rpc-listen-all=true \
     --rpc-allow-origin-all=true \
