@@ -149,4 +149,4 @@ class MongoDB:
 
 # --- CREATE SINGLETON INSTANCE ---
 db = MongoDB()
-asyncio.create_task(db.init_indexes())
+# ERROR WAS HERE: Removed global asyncio.create_task call
