@@ -7,8 +7,8 @@ ENV PYTHONUNBUFFERED=1
 ENV PORT=8000
 
 # Install system dependencies
-# 1. Core tools (ffmpeg, aria2, etc.)
-# 2. Chromium dependencies (replacing broken 'playwright install-deps')
+# 1. Core tools: ffmpeg, aria2, procps (for pkill)
+# 2. Chromium dependencies: Manually installed to avoid 'playwright install-deps' issues
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     aria2 \
@@ -47,17 +47,18 @@ RUN playwright install chromium
 COPY . .
 
 # --- CLEANUP STEP 1: BUILD TIME ---
-# This removes any junk (downloads, cache, git history) that you might have
-# accidentally uploaded from your PC. It ensures the image is 100% fresh.
-RUN rm -rf /app/downloads /app/__pycache__ /app/.git /app/.github && \
+# Removes any junk (downloads, cache, git history) accidentally copied from your PC.
+# This ensures the Docker image is as small and clean as possible.
+RUN rm -rf /app/downloads /app/__pycache__ /app/.git /app/.github /app/bot/__pycache__ /app/utils/__pycache__ && \
     mkdir -p /app/downloads
 
-# Expose the port
+# Expose the port for the Health Check Server
 EXPOSE 8000
 
 # --- CLEANUP STEP 2: STARTUP TIME ---
-# 1. 'pkill': Kills any "Zombie" Aria2 processes from previous crashes.
-# 2. 'rm -rf': Clears old downloads to free up space before starting.
+# 1. 'pkill': Kills any "Zombie" Aria2 processes if the container restarted.
+# 2. 'rm -rf': Clears old downloads to free up disk space.
+# 3. 'exec': Critical! Replaces shell with Python so signals (SIGTERM) reach the bot.
 CMD pkill -f aria2c || true && \
     rm -rf /app/downloads/* && \
     aria2c \
@@ -70,4 +71,4 @@ CMD pkill -f aria2c || true && \
     --min-split-size=10M \
     --max-concurrent-downloads=5 \
     --bt-tracker="udp://tracker.opentrackr.org:1337/announce,udp://tracker.openbittorrent.com:80/announce,udp://opentracker.i2p.rocks:6969/announce,udp://tracker.internetwarriors.net:1337/announce,udp://tracker.leechers-paradise.org:6969/announce,udp://coppersurfer.tk:6969/announce,udp://tracker.zer0day.to:1337/announce" \
-    && python main.py
+    && exec python main.py
