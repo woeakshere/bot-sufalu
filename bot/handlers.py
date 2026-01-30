@@ -4,6 +4,7 @@ import logging
 import time
 import traceback
 import asyncio
+import sys # <--- Required for restarting
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
@@ -31,6 +32,9 @@ logger = logging.getLogger(__name__)
 
 downloader = TorrentDownloader()
 BOT_START_TIME = time.time()
+
+# --- WORKER STATE (Recycling Counter) ---
+JOBS_PROCESSED = 0 
 
 # --- HELPER FUNCTIONS ---
 def get_progress_bar(percentage, length=10):
@@ -88,6 +92,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         f"📊 **Status**\n"
         f"**CPU**: `{cpu}%` | **RAM**: `{ram.percent}%`\n"
+        f"**Jobs**: `{JOBS_PROCESSED}/{Config.WORKER_TTL}`\n"
         f"**Users**: `{total_users}`\n"
         f"**Traffic**: ⬇️ `{human_readable_size(down)}` | ⬆️ `{human_readable_size(up)}`"
     )
@@ -107,9 +112,7 @@ async def set_thumb_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- ADMIN COMMANDS ---
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    # 1. MULTI-ADMIN CHECK
-    if user_id not in Config.ADMIN_IDS:
-        return # Silent ignore for non-admins
+    if user_id not in Config.ADMIN_IDS: return
 
     if not context.args:
         return await update.message.reply_text("❌ Usage: `/broadcast <message>`")
@@ -133,8 +136,10 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- CORE LOGIC ---
 async def monitor_and_process_download(gid, update, context, status_msg):
+    # Access Global Job Counter
+    global JOBS_PROCESSED 
+
     try:
-        # 2. CREATE CANCEL BUTTON
         cancel_btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Task", callback_data=f"cancel_{gid}")]])
 
         async def progress_callback(status):
@@ -144,7 +149,7 @@ async def monitor_and_process_download(gid, update, context, status_msg):
                     await status_msg.edit_text(
                         f"📥 **Downloading...** {p}%\n"
                         f"🚀 `{status['speed']}` | ⏳ `{status.get('eta', 'N/A')}`",
-                        reply_markup=cancel_btn, # <--- Attach button here
+                        reply_markup=cancel_btn,
                         parse_mode="Markdown"
                     )
             except: pass
@@ -181,6 +186,7 @@ async def monitor_and_process_download(gid, update, context, status_msg):
                     final_path = v_path
                     sub_path = None
                     
+                    # Subtitle Check
                     base = os.path.splitext(v_path)[0]
                     for ext in [".srt", ".vtt", ".ass"]:
                         if os.path.exists(base + ext):
@@ -197,6 +203,7 @@ async def monitor_and_process_download(gid, update, context, status_msg):
                                 fname = os.path.basename(final_path)
                         except ImportError: pass
 
+                    # Upload
                     try:
                         await status_msg.edit_text(f"⬆️ **Uploading ({idx+1}/{len(files)})**")
                         with open(final_path, 'rb') as doc:
@@ -225,6 +232,18 @@ async def monitor_and_process_download(gid, update, context, status_msg):
                 
                 if os.path.isdir(base_path): shutil.rmtree(base_path)
                 
+                # --- WORKER RECYCLING LOGIC ---
+                if Config.WORKER_TTL > 0:
+                    JOBS_PROCESSED += 1
+                    logger.info(f"✅ Job Done. Worker State: {JOBS_PROCESSED}/{Config.WORKER_TTL}")
+                    
+                    if JOBS_PROCESSED >= Config.WORKER_TTL:
+                        await status_msg.reply_text("♻️ **Scheduled Maintenance**\nRestarting worker to clear memory...", parse_mode="Markdown")
+                        logger.warning(f"♻️ TTL Reached ({Config.WORKER_TTL}). Restarting...")
+                        await asyncio.sleep(2)
+                        os._exit(0) # Triggers Docker Restart
+
+                # Final Success Message (If not restarting)
                 txt = "✅ **Done!**"
                 if last_anime and last_ep:
                     txt += f"\n\n📺 **Tracked**: {last_anime} (Ep {last_ep})"
@@ -232,9 +251,10 @@ async def monitor_and_process_download(gid, update, context, status_msg):
                     await status_msg.edit_text(txt, reply_markup=InlineKeyboardMarkup(btn), parse_mode="Markdown")
                 else:
                     await status_msg.edit_text(txt, parse_mode="Markdown")
+
             else:
                 await status_msg.edit_text("❌ File missing.")
-        # 3. HANDLE CANCELLED STATE
+        
         elif status and status["status"] == "removed":
             await status_msg.edit_text("❌ **Task Cancelled.**", parse_mode="Markdown")
         else:
@@ -300,7 +320,6 @@ async def button_callback(update, context):
         context.args = d.split("_", 1)[1].split(" ")
         await search(update, context)
     
-    # 4. CANCEL LOGIC
     elif d.startswith("cancel_"):
         gid = d.split("_", 1)[1]
         try:
